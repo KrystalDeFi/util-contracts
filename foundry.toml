@@ -1,0 +1,19 @@
+[profile.default]
+src = 'contracts'
+out = 'out'
+libs = ['node_modules', 'lib']
+test = 'test'
+optimizer = true
+optimizer_runs = 150
+via_ir = true
+solc_version = '0.8.28'
+evm_version = 'cancun'
+bytecode_hash = 'none'
+
+[fmt]
+bracket_spacing = true
+int_types = "long"
+line_length = 120
+tab_width = 2
+quote_style = "double"
+number_underscore = "thousands"

@@ -1,0 +1,11 @@
+{
+  "name": "@krystal/util-contracts",
+  "version": "0.1.0",
+  "description": "Krystal utility smart contracts",
+  "license": "MIT",
+  "repository": "git@github.com:KrystalDeFi/util-contracts.git",
+  "files": ["contracts"],
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.2.0"
+  }
+}
