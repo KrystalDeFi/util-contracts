@@ -175,8 +175,8 @@ contract SignatureValidatorTest is Test {
     assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, malformed));
   }
 
-  // Core guarantee: the view path must NEVER revert on ANY input (the HIGH-1 contract), across the
-  // whole input space — not just the specific malformed shapes covered above.
+  // Fuzzes (signer,hash,sig) through the no-revert view path; fuzzed signers almost never have code,
+  // so the ERC-1271 leg is covered by the dedicated reverting/short-return delegate tests below.
   function testFuzz_isValidSignatureNow_neverReverts(address signer, bytes32 hash, bytes memory sig) public view {
     SignatureValidator.isValidSignatureNow(signer, hash, sig); // must return (not revert)
   }
@@ -187,7 +187,10 @@ contract SignatureValidatorTest is Test {
     uint256 pk = 0xA11CE;
     address eoa = vm.addr(pk);
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
-    uint256 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFBAAEDCE6AF48A03BBFD25E8CD0364141; // secp256k1 order
+    uint256 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141; // secp256k1 curve order N
+    // With the correct N, highS = n - s lands in (N/2, N): an s-value the raw ecrecover precompile
+    // ACCEPTS (s < N) but OZ's malleability guard REJECTS (s > N/2) — so assertFalse below genuinely
+    // proves the guard fires, rather than the signature merely being out of ecrecover's own s<N bound.
     bytes32 highS = bytes32(n - uint256(s));
     uint8 flippedV = v == 27 ? 28 : 27;
     bytes memory malleable = abi.encodePacked(r, highS, flippedV);

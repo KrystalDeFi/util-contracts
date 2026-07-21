@@ -39,11 +39,12 @@ npm install && forge test -vvv
 
 ## Compatibility
 
-**ECDSA signature length.** The ECDSA leg delegates to OpenZeppelin `ECDSA.tryRecover`. On OZ
-**≥5.6** it accepts only 65-byte `(r,s,v)` signatures (EIP-2098 64-byte compact are rejected); on
-5.0–5.5 both are accepted. This library is validated against OZ ≥5.6. Because the library is
-distributed as source and inlined into the consumer's build, the **consumer's** resolved OZ
-version governs — pin OZ ≥5.6 for deterministic 65-byte-only behavior.
+**ECDSA signature length.** The ECDSA leg uses OZ `ECDSA.tryRecover(bytes32,bytes)`, which accepts
+only 65-byte `(r,s,v)` signatures across the entire supported OZ 5.x range (EIP-2098 64-byte
+compact signatures use OZ's separate `(r,vs)` overload, which this library does not call).
+Behavior is therefore consistent across OZ 5.x — the ECDSA leg is deterministic regardless of the
+consumer's 5.x minor version. That `tryRecover(bytes)` overload is deprecated in OZ and removed in
+v6.0, so this library requires OZ `<6.0.0`.
 
 **EVM version.** Compiled/tested at `evm_version = cancun` (uses PUSH0). Since the library is
 inlined, the consumer's compiler settings govern deployment — consumers targeting pre-PUSH0 /
