@@ -28,6 +28,8 @@ library SignatureValidator {
   ///         ERC-1271 (attempted only when `signer` has code) OR ECDSA recovery (always attempted).
   ///         If `signature` is ERC-6492-wrapped it is unwrapped first; the factory-deploy prepare
   ///         step is NOT performed here (this is a view), so a not-yet-deployed account returns false.
+  /// @dev For an EIP-7702 signer the raw root-key ECDSA signature is accepted UNCONDITIONALLY,
+  ///      overriding the account's own `isValidSignature` policy — see the contract-level NOTE.
   function isValidSignatureNow(address signer, bytes32 hash, bytes memory signature) internal view returns (bool) {
     if (signer == address(0)) return false;
     bytes memory sig = signature;
@@ -93,7 +95,7 @@ library SignatureValidator {
     // 6492 wrappers. (Out-of-bounds offsets in a long-enough body are handled by _tryDecodeERC6492.)
     if (sig.length < 128) return false;
     bytes32 suffix;
-    assembly {
+    assembly ("memory-safe") {
       suffix := mload(add(add(sig, 0x20), sub(mload(sig), 32)))
     }
     return suffix == ERC6492_DETECTION_SUFFIX;
@@ -113,13 +115,13 @@ library SignatureValidator {
     if (sig.length < 128) return (false, address(0), "", "");
     uint256 bodyLen = sig.length - 32; // >= 96 (three 32-byte head words)
     uint256 base;
-    assembly {
+    assembly ("memory-safe") {
       base := add(sig, 0x20) // the body occupies the first `bodyLen` bytes of sig's data
     }
     uint256 word0;
     uint256 off1;
     uint256 off2;
-    assembly {
+    assembly ("memory-safe") {
       word0 := mload(base)
       off1 := mload(add(base, 0x20))
       off2 := mload(add(base, 0x40))
@@ -142,14 +144,14 @@ library SignatureValidator {
     // length word must be fully in-bounds: off + 32 <= bodyLen (overflow-safe form)
     if (off > bodyLen || bodyLen - off < 0x20) return (false, "");
     uint256 len;
-    assembly {
+    assembly ("memory-safe") {
       len := mload(add(base, off))
     }
     uint256 dataStart = off + 0x20;
     // data must be fully in-bounds: dataStart + len <= bodyLen (overflow-safe form)
     if (len > bodyLen - dataStart) return (false, "");
     out = new bytes(len);
-    assembly {
+    assembly ("memory-safe") {
       let src := add(base, dataStart)
       let dst := add(out, 0x20)
       for { let i := 0 } lt(i, len) { i := add(i, 0x20) } { mstore(add(dst, i), mload(add(src, i))) }

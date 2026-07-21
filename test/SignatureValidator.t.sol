@@ -23,6 +23,22 @@ contract MockERC1271Wallet {
 
 /// @dev A Biz-style 7702 delegate: only accepts a signature over an EIP-712-WRAPPED hash, and
 ///      requires recover(...) == address(this). Etched onto an EOA to simulate 7702.
+contract RevertingERC1271Wallet {
+  function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+    revert("delegate reverted");
+  }
+}
+
+contract ShortReturnERC1271Wallet {
+  // Returns only 4 bytes (the magic value un-padded) instead of a full 32-byte word.
+  function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+    assembly ("memory-safe") {
+      mstore(0x00, 0x1626ba7e00000000000000000000000000000000000000000000000000000000)
+      return(0x00, 4)
+    }
+  }
+}
+
 contract MockWrapped7702Wallet {
   bytes4 constant MAGIC = 0x1626ba7e;
 
@@ -157,6 +173,41 @@ contract SignatureValidatorTest is Test {
       SignatureValidator.ERC6492_DETECTION_SUFFIX
     );
     assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, malformed));
+  }
+
+  // Core guarantee: the view path must NEVER revert on ANY input (the HIGH-1 contract), across the
+  // whole input space — not just the specific malformed shapes covered above.
+  function testFuzz_isValidSignatureNow_neverReverts(address signer, bytes32 hash, bytes memory sig) public view {
+    SignatureValidator.isValidSignatureNow(signer, hash, sig); // must return (not revert)
+  }
+
+  // Malleability: the high-s counterpart of a valid signature must be rejected (OZ tryRecover guards
+  // high-s and v). Locks this behavior against a future dependency swap.
+  function test_ecdsa_highSMalleable_rejected() public view {
+    uint256 pk = 0xA11CE;
+    address eoa = vm.addr(pk);
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
+    uint256 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFBAAEDCE6AF48A03BBFD25E8CD0364141; // secp256k1 order
+    bytes32 highS = bytes32(n - uint256(s));
+    uint8 flippedV = v == 27 ? 28 : 27;
+    bytes memory malleable = abi.encodePacked(r, highS, flippedV);
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, malleable));
+  }
+
+  // A delegate whose isValidSignature REVERTS must not bubble up — the ERC-1271 leg yields false and
+  // the check falls through to ECDSA (which also fails here) → overall false, no revert.
+  function test_erc1271_revertingDelegate_doesNotBubble_returnsFalse() public {
+    RevertingERC1271Wallet w = new RevertingERC1271Wallet();
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xBEEF, HASH);
+    assertFalse(SignatureValidator.isValidSignatureNow(address(w), HASH, abi.encodePacked(r, s, v)));
+  }
+
+  // A delegate returning <32 bytes must be rejected by the `ret.length >= 32` guard (which prevents an
+  // abi.decode revert), falling through to ECDSA → overall false, no revert.
+  function test_erc1271_shortReturn_doesNotRevert_returnsFalse() public {
+    ShortReturnERC1271Wallet w = new ShortReturnERC1271Wallet();
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xBEEF, HASH);
+    assertFalse(SignatureValidator.isValidSignatureNow(address(w), HASH, abi.encodePacked(r, s, v)));
   }
 }
 

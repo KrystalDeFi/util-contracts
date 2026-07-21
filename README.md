@@ -37,6 +37,18 @@ Add to `remappings.txt`:
 npm install && forge test -vvv
 ```
 
+## Compatibility
+
+**ECDSA signature length.** The ECDSA leg delegates to OpenZeppelin `ECDSA.tryRecover`. On OZ
+**≥5.6** it accepts only 65-byte `(r,s,v)` signatures (EIP-2098 64-byte compact are rejected); on
+5.0–5.5 both are accepted. This library is validated against OZ ≥5.6. Because the library is
+distributed as source and inlined into the consumer's build, the **consumer's** resolved OZ
+version governs — pin OZ ≥5.6 for deterministic 65-byte-only behavior.
+
+**EVM version.** Compiled/tested at `evm_version = cancun` (uses PUSH0). Since the library is
+inlined, the consumer's compiler settings govern deployment — consumers targeting pre-PUSH0 /
+older chains should set their own `evm_version` accordingly (EIP-7702's audience is multi-chain).
+
 ## Security notes
 
 **EIP-7702 root-key override.** For a 7702 signer, a valid signature from the account's root
