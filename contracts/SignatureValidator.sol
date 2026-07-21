@@ -12,6 +12,10 @@ import { IERC1271 } from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 ///         code AND a controlling EOA key: such an account may present a raw EOA signature (ECDSA
 ///         leg) or a signature its delegate validates via `isValidSignature` (ERC-1271 leg).
 ///         ERC-6492 wrapped signatures are supported for counterfactual (not-yet-deployed) accounts.
+///         NOTE: for an EIP-7702 signer, a valid signature from the account's root EOA key over `hash`
+///         is accepted UNCONDITIONALLY via the ECDSA leg, OVERRIDING any restriction the account's own
+///         `isValidSignature` would enforce (e.g. wrapped-digest replay protection, session-key scoping,
+///         2FA). Consumers relying on a 7702 account's signature policy must account for this.
 library SignatureValidator {
   /// @dev ERC-1271 magic value: `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
   bytes4 internal constant ERC1271_MAGIC_VALUE = 0x1626ba7e;
@@ -24,15 +28,12 @@ library SignatureValidator {
   ///         ERC-1271 (attempted only when `signer` has code) OR ECDSA recovery (always attempted).
   ///         If `signature` is ERC-6492-wrapped it is unwrapped first; the factory-deploy prepare
   ///         step is NOT performed here (this is a view), so a not-yet-deployed account returns false.
-  function isValidSignatureNow(address signer, bytes32 hash, bytes memory signature)
-    internal
-    view
-    returns (bool)
-  {
+  function isValidSignatureNow(address signer, bytes32 hash, bytes memory signature) internal view returns (bool) {
     if (signer == address(0)) return false;
     bytes memory sig = signature;
     if (_isERC6492(sig)) {
-      (,, bytes memory inner) = _decodeERC6492(sig);
+      (bool okDecode,,, bytes memory inner) = _tryDecodeERC6492(sig);
+      if (!okDecode) return false;
       sig = inner;
     }
     return _dualCheck(signer, hash, sig);
@@ -41,6 +42,16 @@ library SignatureValidator {
   /// @notice NON-VIEW full ERC-6492. If `signature` is 6492-wrapped and `signer` has no code, calls
   ///         `factory` with `factoryCalldata` to deploy the account, then runs the dual-path check.
   ///         Never reverts on an invalid signature; returns false instead.
+  /// @dev SECURITY: this makes an arbitrary external call `factory.call(factoryCalldata)` with BOTH the
+  ///      target and the calldata taken from the (untrusted) signature, executed from the CALLER's own
+  ///      context (this is an inlined internal library). It fires whenever `signer` has no code and
+  ///      `factory` is non-zero, BEFORE and INDEPENDENT of the validation result — a returned `false`
+  ///      is NOT a safety net. Treat it as an arbitrary-call / reentrancy primitive: callers MUST gate
+  ///      it behind a reentrancy guard, MUST NOT invoke it mid-operation while holding funds, approvals,
+  ///      or privileged roles, and should only pass signatures from a trusted source. The ERC-6492
+  ///      reference isolates this in a stateless singleton validator; this inlined form does not. Prefer
+  ///      `isValidSignatureNow` (view, no side effects) unless you specifically need counterfactual
+  ///      account deployment.
   function isValidSignatureNowWithSideEffects(address signer, bytes32 hash, bytes memory signature)
     internal
     returns (bool)
@@ -48,11 +59,12 @@ library SignatureValidator {
     if (signer == address(0)) return false;
     bytes memory sig = signature;
     if (_isERC6492(sig)) {
-      (address factory, bytes memory factoryCalldata, bytes memory inner) = _decodeERC6492(sig);
+      (bool okDecode, address factory, bytes memory factoryCalldata, bytes memory inner) = _tryDecodeERC6492(sig);
+      if (!okDecode) return false;
       if (signer.code.length == 0 && factory != address(0)) {
-        // Best-effort deploy; if it fails the dual-path below simply returns false.
-        (bool ok,) = factory.call(factoryCalldata);
-        ok;
+        // Best-effort deploy; result intentionally ignored — the dual-check below decides validity.
+        (bool success,) = factory.call(factoryCalldata);
+        success;
       }
       sig = inner;
     }
@@ -72,13 +84,14 @@ library SignatureValidator {
   }
 
   function _isValidERC1271(address signer, bytes32 hash, bytes memory sig) private view returns (bool) {
-    (bool ok, bytes memory ret) =
-      signer.staticcall(abi.encodeCall(IERC1271.isValidSignature, (hash, sig)));
+    (bool ok, bytes memory ret) = signer.staticcall(abi.encodeCall(IERC1271.isValidSignature, (hash, sig)));
     return ok && ret.length >= 32 && abi.decode(ret, (bytes4)) == ERC1271_MAGIC_VALUE;
   }
 
   function _isERC6492(bytes memory sig) private pure returns (bool) {
-    if (sig.length < 128) return false; // 32-byte suffix + at least a 96-byte ABI head for (address,bytes,bytes), so a too-short 6492-tagged signature is treated as non-6492 and falls through to the dual-check (which safely returns false) instead of reverting in abi.decode.
+    // A 6492 wrapper needs a 32-byte suffix plus at least a 96-byte ABI head; shorter inputs cannot be
+    // 6492 wrappers. (Out-of-bounds offsets in a long-enough body are handled by _tryDecodeERC6492.)
+    if (sig.length < 128) return false;
     bytes32 suffix;
     assembly {
       suffix := mload(add(add(sig, 0x20), sub(mload(sig), 32)))
@@ -86,18 +99,58 @@ library SignatureValidator {
     return suffix == ERC6492_DETECTION_SUFFIX;
   }
 
-  function _decodeERC6492(bytes memory sig)
+  /// @dev Bounds-checked decode of an ERC-6492 wrapper body `abi.encode(address, bytes, bytes)`.
+  ///      Returns ok=false (NEVER reverts) if the body is malformed — so a crafted signature cannot
+  ///      force `abi.decode` to revert and break the "never reverts" contract. `sig` is assumed
+  ///      6492-tagged with `sig.length >= 128` (guaranteed by `_isERC6492`).
+  function _tryDecodeERC6492(bytes memory sig)
     private
     pure
-    returns (address factory, bytes memory factoryCalldata, bytes memory inner)
+    returns (bool ok, address factory, bytes memory factoryCalldata, bytes memory inner)
   {
-    uint256 bodyLen = sig.length - 32;
-    bytes memory body = new bytes(bodyLen);
+    uint256 bodyLen = sig.length - 32; // >= 96 (three 32-byte head words)
+    uint256 base;
     assembly {
-      let src := add(sig, 0x20)
-      let dst := add(body, 0x20)
-      for { let i := 0 } lt(i, bodyLen) { i := add(i, 0x20) } { mstore(add(dst, i), mload(add(src, i))) }
+      base := add(sig, 0x20) // the body occupies the first `bodyLen` bytes of sig's data
     }
-    (factory, factoryCalldata, inner) = abi.decode(body, (address, bytes, bytes));
+    uint256 word0;
+    uint256 off1;
+    uint256 off2;
+    assembly {
+      word0 := mload(base)
+      off1 := mload(add(base, 0x20))
+      off2 := mload(add(base, 0x40))
+    }
+    if (word0 >> 160 != 0) return (false, address(0), "", ""); // dirty address high bits
+    factory = address(uint160(word0));
+
+    bool ok1;
+    (ok1, factoryCalldata) = _readTailBytes(base, bodyLen, off1);
+    if (!ok1) return (false, address(0), "", "");
+    bool ok2;
+    (ok2, inner) = _readTailBytes(base, bodyLen, off2);
+    if (!ok2) return (false, address(0), "", "");
+    ok = true;
+  }
+
+  /// @dev Reads a `bytes` field located at `off` within the `bodyLen`-byte region starting at memory
+  ///      pointer `base`, with full bounds checks. Returns ok=false (no revert) on any inconsistency.
+  function _readTailBytes(uint256 base, uint256 bodyLen, uint256 off) private pure returns (bool ok, bytes memory out) {
+    // length word must be fully in-bounds: off + 32 <= bodyLen (overflow-safe form)
+    if (off > bodyLen || bodyLen - off < 0x20) return (false, "");
+    uint256 len;
+    assembly {
+      len := mload(add(base, off))
+    }
+    uint256 dataStart = off + 0x20;
+    // data must be fully in-bounds: dataStart + len <= bodyLen (overflow-safe form)
+    if (len > bodyLen - dataStart) return (false, "");
+    out = new bytes(len);
+    assembly {
+      let src := add(base, dataStart)
+      let dst := add(out, 0x20)
+      for { let i := 0 } lt(i, len) { i := add(i, 0x20) } { mstore(add(dst, i), mload(add(src, i))) }
+    }
+    ok = true;
   }
 }

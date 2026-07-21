@@ -10,9 +10,13 @@ import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/Sig
 contract MockERC1271Wallet {
   bytes4 constant MAGIC = 0x1626ba7e;
   address public immutable owner;
-  constructor(address _owner) { owner = _owner; }
+
+  constructor(address _owner) {
+    owner = _owner;
+  }
+
   function isValidSignature(bytes32 hash, bytes calldata sig) external view returns (bytes4) {
-    (address rec, ECDSA.RecoverError err, ) = ECDSA.tryRecover(hash, sig);
+    (address rec, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, sig);
     return (err == ECDSA.RecoverError.NoError && rec == owner) ? MAGIC : bytes4(0xffffffff);
   }
 }
@@ -21,11 +25,13 @@ contract MockERC1271Wallet {
 ///      requires recover(...) == address(this). Etched onto an EOA to simulate 7702.
 contract MockWrapped7702Wallet {
   bytes4 constant MAGIC = 0x1626ba7e;
+
   function wrap(bytes32 hash) public view returns (bytes32) {
     return keccak256(abi.encodePacked("\x19Wrapped:", block.chainid, address(this), hash));
   }
+
   function isValidSignature(bytes32 hash, bytes calldata sig) external view returns (bytes4) {
-    (address rec, ECDSA.RecoverError err, ) = ECDSA.tryRecover(wrap(hash), sig);
+    (address rec, ECDSA.RecoverError err,) = ECDSA.tryRecover(wrap(hash), sig);
     return (err == ECDSA.RecoverError.NoError && rec == address(this)) ? MAGIC : bytes4(0xffffffff);
   }
 }
@@ -108,6 +114,24 @@ contract SignatureValidatorTest is Test {
     bytes memory shortBody = abi.encodePacked(bytes32(0), bytes32(0), SignatureValidator.ERC6492_DETECTION_SUFFIX);
     assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, shortBody));
   }
+
+  // HIGH-1 regression: a 6492-tagged signature that is long enough (>=128) but whose ABI offsets are
+  // out of bounds must NOT revert in abi.decode — it must be treated as invalid and return false.
+  function test_view_malformed6492Body_doesNotRevert_returnsFalse() public view {
+    address eoa = vm.addr(0xA11CE);
+    // head = [factory=0, offset1=4096 (out of bounds), offset2=0] ++ 6492 suffix => 128 bytes
+    bytes memory malformed =
+      abi.encodePacked(bytes32(0), bytes32(uint256(4096)), bytes32(0), SignatureValidator.ERC6492_DETECTION_SUFFIX);
+    assertEq(malformed.length, 128);
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, malformed));
+  }
+
+  function test_sideEffects_malformed6492Body_doesNotRevert_returnsFalse() public {
+    address eoa = vm.addr(0xA11CE);
+    bytes memory malformed =
+      abi.encodePacked(bytes32(0), bytes32(uint256(4096)), bytes32(0), SignatureValidator.ERC6492_DETECTION_SUFFIX);
+    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, malformed));
+  }
 }
 
 /// @dev CREATE2 factory that deploys a MockERC1271Wallet at a deterministic address.
@@ -118,10 +142,13 @@ contract Mock6492Factory {
       addr := create2(0, add(code, 0x20), mload(code), salt)
     }
   }
+
   function predict(bytes32 salt, address owner) external view returns (address) {
     bytes32 h = keccak256(
       abi.encodePacked(
-        bytes1(0xff), address(this), salt,
+        bytes1(0xff),
+        address(this),
+        salt,
         keccak256(abi.encodePacked(type(MockERC1271Wallet).creationCode, abi.encode(owner)))
       )
     );
@@ -145,8 +172,7 @@ contract SignatureValidator6492Test is Test {
     bytes memory inner = abi.encodePacked(r, s, v);
     bytes memory factoryCalldata = abi.encodeCall(Mock6492Factory.deploy, (SALT, vm.addr(ownerPk)));
     wrappedSig = abi.encodePacked(
-      abi.encode(address(factory), factoryCalldata, inner),
-      SignatureValidator.ERC6492_DETECTION_SUFFIX
+      abi.encode(address(factory), factoryCalldata, inner), SignatureValidator.ERC6492_DETECTION_SUFFIX
     );
   }
 
