@@ -109,3 +109,60 @@ contract SignatureValidatorTest is Test {
     assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, shortBody));
   }
 }
+
+/// @dev CREATE2 factory that deploys a MockERC1271Wallet at a deterministic address.
+contract Mock6492Factory {
+  function deploy(bytes32 salt, address owner) external returns (address addr) {
+    bytes memory code = abi.encodePacked(type(MockERC1271Wallet).creationCode, abi.encode(owner));
+    assembly {
+      addr := create2(0, add(code, 0x20), mload(code), salt)
+    }
+  }
+  function predict(bytes32 salt, address owner) external view returns (address) {
+    bytes32 h = keccak256(
+      abi.encodePacked(
+        bytes1(0xff), address(this), salt,
+        keccak256(abi.encodePacked(type(MockERC1271Wallet).creationCode, abi.encode(owner)))
+      )
+    );
+    return address(uint160(uint256(h)));
+  }
+}
+
+contract SignatureValidator6492Test is Test {
+  bytes32 constant HASH = keccak256("krystal-order-digest");
+  bytes32 constant SALT = bytes32(uint256(1));
+
+  Mock6492Factory factory;
+  uint256 ownerPk = 0xC0FFEE;
+  address counterfactual;
+  bytes wrappedSig;
+
+  function setUp() public {
+    factory = new Mock6492Factory();
+    counterfactual = factory.predict(SALT, vm.addr(ownerPk));
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, HASH);
+    bytes memory inner = abi.encodePacked(r, s, v);
+    bytes memory factoryCalldata = abi.encodeCall(Mock6492Factory.deploy, (SALT, vm.addr(ownerPk)));
+    wrappedSig = abi.encodePacked(
+      abi.encode(address(factory), factoryCalldata, inner),
+      SignatureValidator.ERC6492_DETECTION_SUFFIX
+    );
+  }
+
+  function test_6492_view_beforeDeploy_invalid() public view {
+    assertEq(counterfactual.code.length, 0);
+    assertFalse(SignatureValidator.isValidSignatureNow(counterfactual, HASH, wrappedSig));
+  }
+
+  function test_6492_sideEffects_deploysAndValidates() public {
+    assertEq(counterfactual.code.length, 0);
+    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(counterfactual, HASH, wrappedSig));
+    assertGt(counterfactual.code.length, 0); // factory deployed it
+  }
+
+  function test_6492_view_afterDeploy_valid() public {
+    factory.deploy(SALT, vm.addr(ownerPk)); // account now exists
+    assertTrue(SignatureValidator.isValidSignatureNow(counterfactual, HASH, wrappedSig));
+  }
+}
