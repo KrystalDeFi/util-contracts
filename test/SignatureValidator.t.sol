@@ -33,7 +33,7 @@ contract MockWrapped7702Wallet {
 contract SignatureValidatorTest is Test {
   bytes32 constant HASH = keccak256("krystal-order-digest");
 
-  function test_eoa_rawSig_valid() public {
+  function test_eoa_rawSig_valid() public view {
     uint256 pk = 0xA11CE;
     address eoa = vm.addr(pk);
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
@@ -41,7 +41,7 @@ contract SignatureValidatorTest is Test {
     assertTrue(SignatureValidator.isValidSignatureNow(eoa, HASH, sig));
   }
 
-  function test_eoa_wrongKey_invalid() public {
+  function test_eoa_wrongKey_invalid() public view {
     address eoa = vm.addr(0xA11CE);
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xBEEF, HASH);
     assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, abi.encodePacked(r, s, v)));
@@ -88,13 +88,24 @@ contract SignatureValidatorTest is Test {
     assertTrue(SignatureValidator.isValidSignatureNow(acct, HASH, abi.encodePacked(r, s, v)));
   }
 
-  function test_zeroSigner_invalid() public {
+  function test_zeroSigner_invalid() public view {
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xA11CE, HASH);
     assertFalse(SignatureValidator.isValidSignatureNow(address(0), HASH, abi.encodePacked(r, s, v)));
   }
 
-  function test_garbageSig_invalid() public {
+  function test_garbageSig_invalid() public view {
     address eoa = vm.addr(0xA11CE);
     assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, hex"deadbeef"));
+  }
+
+  // A signature whose last 32 bytes equal the 6492 magic but is too short to be a real
+  // 6492 wrapper must NOT revert in abi.decode — it must be treated as a normal (invalid) sig.
+  function test_malformed6492Suffix_doesNotRevert_returnsFalse() public view {
+    address eoa = vm.addr(0xA11CE);
+    bytes memory justTheSuffix = abi.encodePacked(SignatureValidator.ERC6492_DETECTION_SUFFIX); // 32 bytes
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, justTheSuffix));
+    // A 96-byte body (< the 128 threshold) ending in the suffix is likewise treated as non-6492.
+    bytes memory shortBody = abi.encodePacked(bytes32(0), bytes32(0), SignatureValidator.ERC6492_DETECTION_SUFFIX);
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, shortBody));
   }
 }

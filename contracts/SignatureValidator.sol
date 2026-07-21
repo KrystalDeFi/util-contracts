@@ -78,7 +78,7 @@ library SignatureValidator {
   }
 
   function _isERC6492(bytes memory sig) private pure returns (bool) {
-    if (sig.length < 32) return false;
+    if (sig.length < 128) return false; // 32-byte suffix + at least a 96-byte ABI head for (address,bytes,bytes), so a too-short 6492-tagged signature is treated as non-6492 and falls through to the dual-check (which safely returns false) instead of reverting in abi.decode.
     bytes32 suffix;
     assembly {
       suffix := mload(add(add(sig, 0x20), sub(mload(sig), 32)))
