@@ -54,6 +54,9 @@ library SignatureValidator {
   ///      reference isolates this in a stateless singleton validator; this inlined form does not. Prefer
   ///      `isValidSignatureNow` (view, no side effects) unless you specifically need counterfactual
   ///      account deployment.
+  /// @custom:precondition A consumer that adopts this function MUST (not "should") call it behind a
+  ///      reentrancy guard and MUST NOT hold funds, token approvals, or privileged roles at the call
+  ///      site. Adopting it without both is a security defect in the consumer, not a hardening TODO.
   function isValidSignatureNowWithSideEffects(address signer, bytes32 hash, bytes memory signature)
     internal
     returns (bool)
@@ -85,9 +88,25 @@ library SignatureValidator {
     return err == ECDSA.RecoverError.NoError && recovered == signer;
   }
 
+  /// @dev ERC-1271 leg. Two properties over the plain `staticcall` + `abi.decode(ret,(bytes4))` form:
+  ///      (1) the return-data copy is bounded to a single 32-byte word — a malicious signer returning a
+  ///      huge blob cannot force an unbounded memory copy in this (the caller's) context, only the first
+  ///      word is brought into memory; and (2) the word is compared in full against `bytes32(MAGIC)` (as
+  ///      OZ's `SignatureChecker` does), so a return word carrying the magic in its top 4 bytes but with
+  ///      DIRTY low-order bytes — e.g. a non-compliant wallet returning `bool true` (0x00..01) — yields
+  ///      `false` here instead of REVERTING inside `abi.decode` (which enforces strict ABI padding),
+  ///      preserving the library's never-reverts contract. For a well-formed wallet the verdict is
+  ///      unchanged: (call succeeded, >= 32 bytes returned, first returned word == magic).
   function _isValidERC1271(address signer, bytes32 hash, bytes memory sig) private view returns (bool) {
-    (bool ok, bytes memory ret) = signer.staticcall(abi.encodeCall(IERC1271.isValidSignature, (hash, sig)));
-    return ok && ret.length >= 32 && abi.decode(ret, (bytes4)) == ERC1271_MAGIC_VALUE;
+    bytes memory cd = abi.encodeCall(IERC1271.isValidSignature, (hash, sig));
+    bytes32 word;
+    assembly ("memory-safe") {
+      // Copy at most 32 bytes of return data into scratch (0x00). `word` is loaded only when the call
+      // succeeded AND returned a full word, so a partial (<32-byte) or empty return leaves it at zero.
+      let ok := staticcall(gas(), signer, add(cd, 0x20), mload(cd), 0x00, 0x20)
+      if and(ok, iszero(lt(returndatasize(), 0x20))) { word := mload(0x00) }
+    }
+    return word == bytes32(ERC1271_MAGIC_VALUE);
   }
 
   function _isERC6492(bytes memory sig) private pure returns (bool) {
@@ -127,6 +146,9 @@ library SignatureValidator {
       off2 := mload(add(base, 0x40))
     }
     if (word0 >> 160 != 0) return (false, address(0), "", ""); // dirty address high bits
+    // Safe: the guard above proves the high 96 bits of `word0` are zero, so the uint160 narrowing
+    // cannot truncate. (forge-lint cannot see the guard, so the cast is silenced explicitly.)
+    // forge-lint: disable-next-line(unsafe-typecast)
     factory = address(uint160(word0));
 
     bool ok1;

@@ -39,6 +39,29 @@ contract ShortReturnERC1271Wallet {
   }
 }
 
+/// @dev Returns the magic value in the first word followed by ~100KB of trailing data. A naive
+///      unbounded return-data copy would balloon the CALLER's memory; the bounded ERC-1271 leg copies
+///      only the first 32-byte word and still validates.
+contract HugeReturnERC1271Wallet {
+  function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+    assembly {
+      mstore(0x00, 0x1626ba7e00000000000000000000000000000000000000000000000000000000)
+      // return magic word (0x20) + 100000 bytes of (zero-initialized) trailing blob
+      return(0x00, add(0x20, 100000))
+    }
+  }
+}
+
+/// @dev A non-compliant/legacy ERC-1271 wallet that returns `bool true` (returndata word = 0x00..01)
+///      instead of the bytes4 magic. Its return word carries non-zero LOW-order bytes, so the previous
+///      `abi.decode(ret,(bytes4))` form REVERTS on it (strict ABI padding validation) — the full-word
+///      compare must instead return false without reverting.
+contract BoolTrueERC1271Wallet {
+  function isValidSignature(bytes32, bytes calldata) external pure returns (bool) {
+    return true;
+  }
+}
+
 contract MockWrapped7702Wallet {
   bytes4 constant MAGIC = 0x1626ba7e;
 
@@ -212,11 +235,68 @@ contract SignatureValidatorTest is Test {
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xBEEF, HASH);
     assertFalse(SignatureValidator.isValidSignatureNow(address(w), HASH, abi.encodePacked(r, s, v)));
   }
+
+  // Correctness with large return data: a wallet returning the magic word followed by ~100KB of blob
+  // still validates. (This asserts the verdict is preserved, not the copy bound itself — the bound is a
+  // property of the bounded `staticcall` in the source; see the dirty-return test below for the
+  // behavior change that IS observable from a test.)
+  function test_erc1271_hugeReturnData_valid() public {
+    HugeReturnERC1271Wallet w = new HugeReturnERC1271Wallet();
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xBEEF, HASH); // wallet ignores the sig, always returns magic
+    assertTrue(SignatureValidator.isValidSignatureNow(address(w), HASH, abi.encodePacked(r, s, v)));
+  }
+
+  // Never-reverts regression (risk #3, load-bearing): a non-compliant wallet returning `bool true`
+  // (returndata 0x00..01) has non-zero low-order bytes. The previous `abi.decode(ret,(bytes4))` form
+  // REVERTS on this under strict ABI padding validation — which would break the never-reverts contract.
+  // The full-word compare returns false instead, falling through to the ECDSA leg → overall false, no
+  // revert. This test REVERTS (fails) under the old form and passes under the bounded full-word compare.
+  function test_erc1271_dirtyReturnData_doesNotRevert_returnsFalse() public {
+    BoolTrueERC1271Wallet w = new BoolTrueERC1271Wallet();
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xBEEF, HASH);
+    assertFalse(SignatureValidator.isValidSignatureNow(address(w), HASH, abi.encodePacked(r, s, v)));
+  }
+
+  // Side-effects entry, NON-6492 signature (EOA): the sig is not 6492-tagged, so no external call is
+  // made — validation proceeds via the ECDSA leg exactly like the view entry.
+  function test_sideEffects_plainEoaSig_valid() public {
+    uint256 pk = 0xA11CE;
+    address eoa = vm.addr(pk);
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
+    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, abi.encodePacked(r, s, v)));
+  }
+
+  // Side-effects entry, NON-6492 signature (contract wallet): signer has code, not 6492-tagged → the
+  // ERC-1271 leg validates and no factory call is made.
+  function test_sideEffects_plainContractWallet_valid() public {
+    uint256 pk = 0xC0FFEE;
+    MockERC1271Wallet w = new MockERC1271Wallet(vm.addr(pk));
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
+    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(address(w), HASH, abi.encodePacked(r, s, v)));
+  }
+
+  // EIP-2098 compact (64-byte) signatures are NOT accepted: the ECDSA leg calls OZ
+  // tryRecover(bytes32,bytes), which is 65-byte-only across all supported OZ 5.x (compact sigs use a
+  // separate (r,vs) overload the library never calls). Must return false via both entries, no revert.
+  function test_ecdsa_64byteCompactSig_rejected() public {
+    uint256 pk = 0xA11CE;
+    address eoa = vm.addr(pk);
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
+    bytes32 vs = bytes32((uint256(v - 27) << 255) | uint256(s)); // EIP-2098: yParity in the top bit of s
+    bytes memory compact = abi.encodePacked(r, vs);
+    assertEq(compact.length, 64);
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, compact));
+    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, compact));
+  }
 }
 
-/// @dev CREATE2 factory that deploys a MockERC1271Wallet at a deterministic address.
+/// @dev CREATE2 factory that deploys a MockERC1271Wallet at a deterministic address. Counts deploy()
+///      invocations so tests can assert whether the library did (or did NOT) call it.
 contract Mock6492Factory {
+  uint256 public deployCount;
+
   function deploy(bytes32 salt, address owner) external returns (address addr) {
+    deployCount++;
     bytes memory code = abi.encodePacked(type(MockERC1271Wallet).creationCode, abi.encode(owner));
     assembly {
       addr := create2(0, add(code, 0x20), mload(code), salt)
@@ -270,5 +350,18 @@ contract SignatureValidator6492Test is Test {
   function test_6492_view_afterDeploy_valid() public {
     factory.deploy(SALT, vm.addr(ownerPk)); // account now exists
     assertTrue(SignatureValidator.isValidSignatureNow(counterfactual, HASH, wrappedSig));
+  }
+
+  // Side-effects entry with a 6492 wrapper but the signer is ALREADY deployed: the factory-deploy step
+  // is skipped (the `signer.code.length == 0` guard is false) and validation proceeds via the unwrapped
+  // inner signature through the ERC-1271 leg. Load-bearing: asserts the library did NOT call the factory
+  // (deployCount unchanged) — if the has-code guard were removed, the library would re-invoke deploy and
+  // the count would increment, failing this test.
+  function test_6492_sideEffects_signerHasCode_skipsDeploy_valid() public {
+    factory.deploy(SALT, vm.addr(ownerPk)); // account now exists (deployCount -> 1)
+    assertGt(counterfactual.code.length, 0);
+    uint256 deploysBefore = factory.deployCount();
+    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(counterfactual, HASH, wrappedSig));
+    assertEq(factory.deployCount(), deploysBefore); // factory NOT called: deploy skipped for a coded signer
   }
 }
