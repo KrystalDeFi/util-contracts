@@ -108,6 +108,9 @@ library SignatureValidator {
     pure
     returns (bool ok, address factory, bytes memory factoryCalldata, bytes memory inner)
   {
+    // Defensive: callers guard via _isERC6492, but keep this self-contained (also prevents the
+    // `sig.length - 32` below from underflow-reverting on a short input).
+    if (sig.length < 128) return (false, address(0), "", "");
     uint256 bodyLen = sig.length - 32; // >= 96 (three 32-byte head words)
     uint256 base;
     assembly {

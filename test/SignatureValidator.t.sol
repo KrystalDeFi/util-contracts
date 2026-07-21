@@ -132,6 +132,32 @@ contract SignatureValidatorTest is Test {
       abi.encodePacked(bytes32(0), bytes32(uint256(4096)), bytes32(0), SignatureValidator.ERC6492_DETECTION_SUFFIX);
     assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, malformed));
   }
+
+  // HIGH-1 (guard-2): in-bounds offset but a length word larger than the remaining body → false, no revert.
+  function test_view_malformed6492OverlongLen_returnsFalse() public view {
+    address eoa = vm.addr(0xA11CE);
+    // head=[factory=0, off1=0x60, off2=0x60], len word (max) at offset 0x60, + suffix => 160 bytes (bodyLen 128)
+    bytes memory malformed = abi.encodePacked(
+      bytes32(0),
+      bytes32(uint256(0x60)),
+      bytes32(uint256(0x60)),
+      bytes32(type(uint256).max),
+      SignatureValidator.ERC6492_DETECTION_SUFFIX
+    );
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, malformed));
+  }
+
+  // HIGH-1 (dirty address): a 6492 body whose factory word has dirty high bits → false, no revert.
+  function test_view_malformed6492DirtyFactory_returnsFalse() public view {
+    address eoa = vm.addr(0xA11CE);
+    bytes memory malformed = abi.encodePacked(
+      bytes32(uint256(1) << 200), // dirty high bits above the low 160
+      bytes32(uint256(0x60)),
+      bytes32(uint256(0x60)),
+      SignatureValidator.ERC6492_DETECTION_SUFFIX
+    );
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, malformed));
+  }
 }
 
 /// @dev CREATE2 factory that deploys a MockERC1271Wallet at a deterministic address.
