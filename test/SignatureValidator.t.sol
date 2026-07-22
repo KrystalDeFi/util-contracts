@@ -300,6 +300,33 @@ contract SignatureValidatorTest is Test {
     assertEq(compact.length, 64);
     assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, compact));
   }
+
+  // Mirror of the wrong-key compact case through the side-effects entry (not 6492-tagged → no call).
+  function test_sideEffects_64byteCompactSig_wrongKey_invalid() public {
+    address eoa = vm.addr(0xA11CE);
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xBEEF, HASH); // signed by a different key
+    bytes32 vs = bytes32((uint256(v - 27) << 255) | uint256(s));
+    bytes memory compact = abi.encodePacked(r, vs);
+    assertEq(compact.length, 64);
+    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, compact));
+  }
+
+  // Malleability on the compact path: a 64-byte sig whose decoded `s` lies in the encodable malleable
+  // window (N/2, 2^255) must be rejected by OZ's low-s guard — even though the raw ecrecover precompile
+  // ACCEPTS it and recovers a concrete address. Load-bearing: we assert the very address raw ecrecover
+  // yields is NOT validated, so the false verdict proves the guard fired (not a mere wrong-signer miss).
+  // Mirrors test_ecdsa_highSMalleable_rejected on the compact (r,vs) path.
+  function test_ecdsa_64byteCompactSig_highS_rejected() public view {
+    (, bytes32 r,) = vm.sign(0xA11CE, HASH); // borrow a valid curve x-coordinate for r
+    // s just above N/2 (OZ's threshold) yet below 2^255, so it fits `vs` with parity bit 0 → v = 27.
+    bytes32 sHigh = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A1;
+    address wouldRecover = ecrecover(HASH, 27, r, sHigh); // raw precompile: accepts high-s
+    assertTrue(wouldRecover != address(0), "degenerate vector"); // ensure the test is non-vacuous
+    bytes memory compact = abi.encodePacked(r, sHigh); // vs == sHigh (top bit 0 → v = 27)
+    assertEq(compact.length, 64);
+    // Raw ecrecover would accept and recover `wouldRecover`; our leg must reject via the low-s guard.
+    assertFalse(SignatureValidator.isValidSignatureNow(wouldRecover, HASH, compact));
+  }
 }
 
 /// @dev CREATE2 factory that deploys a MockERC1271Wallet at a deterministic address. Counts deploy()
@@ -375,5 +402,23 @@ contract SignatureValidator6492Test is Test {
     uint256 deploysBefore = factory.deployCount();
     assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(counterfactual, HASH, wrappedSig));
     assertEq(factory.deployCount(), deploysBefore); // factory NOT called: deploy skipped for a coded signer
+  }
+
+  // Deploy SUCCEEDS but validation still fails: the wrapper's factoryCalldata deploys a wallet owned by
+  // ownerPk, but the inner signature is by a DIFFERENT key. After a real on-chain deploy the ERC-1271
+  // leg rejects (wrong owner) and the ECDSA leg can't match the counterfactual address → overall false.
+  // Isolates deploy-success from validation-success (every other 6492 side-effects test deploys AND
+  // validates true).
+  function test_6492_sideEffects_deploysButInnerInvalid_returnsFalse() public {
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xBADBAD, HASH); // inner signed by the WRONG key
+    bytes memory badInner = abi.encodePacked(r, s, v);
+    bytes memory factoryCalldata = abi.encodeCall(Mock6492Factory.deploy, (SALT, vm.addr(ownerPk)));
+    bytes memory wrongWrapped = abi.encodePacked(
+      abi.encode(address(factory), factoryCalldata, badInner), SignatureValidator.ERC6492_DETECTION_SUFFIX
+    );
+    assertEq(counterfactual.code.length, 0);
+    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(counterfactual, HASH, wrongWrapped));
+    assertGt(counterfactual.code.length, 0); // the deploy DID happen — false is a validation miss, not a deploy miss
+    assertEq(factory.deployCount(), 1); // factory was invoked exactly once
   }
 }

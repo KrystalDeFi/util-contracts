@@ -16,6 +16,11 @@ import { IERC1271 } from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 ///         is accepted UNCONDITIONALLY via the ECDSA leg, OVERRIDING any restriction the account's own
 ///         `isValidSignature` would enforce (e.g. wrapped-digest replay protection, session-key scoping,
 ///         2FA). Consumers relying on a 7702 account's signature policy must account for this.
+///         NOTE: the ECDSA leg accepts both 65-byte `(r,s,v)` and 64-byte EIP-2098 `(r,vs)` encodings,
+///         which are inter-convertible WITHOUT the signing key. A single authorization therefore has two
+///         valid on-chain signature encodings, so `keccak256(signature)` is NOT a stable unique id —
+///         consumers MUST do replay protection with nonces or digest/hash invalidation, never by
+///         tracking used signature bytes.
 library SignatureValidator {
   /// @dev ERC-1271 magic value: `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
   bytes4 internal constant ERC1271_MAGIC_VALUE = 0x1626ba7e;
@@ -34,6 +39,10 @@ library SignatureValidator {
     if (signer == address(0)) return false;
     bytes memory sig = signature;
     if (_isERC6492(sig)) {
+      // The full body is decoded (including `factoryCalldata`, which this view entry does not use)
+      // ON PURPOSE: `_tryDecodeERC6492` rejects a wrapper whose factoryCalldata region is malformed, so
+      // this view entry and the side-effects entry return the SAME accept/reject verdict for a given
+      // wrapper. The extra `factoryCalldata` copy is bounded by the wrapper the caller already supplied.
       (bool okDecode,,, bytes memory inner) = _tryDecodeERC6492(sig);
       if (!okDecode) return false;
       sig = inner;

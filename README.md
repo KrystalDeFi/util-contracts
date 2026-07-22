@@ -85,3 +85,13 @@ bytes and its last 32 bytes equal the magic suffix. A genuine (non-6492) signatu
 ≥128 bytes and end in that suffix would be misparsed as a wrapper — this is inherent to ERC-6492's
 detection scheme, not specific to this library. The unwrap is bounds-checked and never reverts, so a
 misparse degrades to a normal (invalid) result rather than an error.
+
+**Signature encodings are not unique.** Because the ECDSA leg accepts both 65-byte `(r,s,v)` and
+64-byte EIP-2098 `(r,vs)` forms, a single authorization has two on-chain encodings that recover to the
+same signer and are freely inter-convertible **without** the signing key (drop `v`, fold its parity
+into `s`'s top bit, and back). Therefore `keccak256(signature)` is **not** a stable unique identifier:
+a consumer that does replay protection by tracking used signature bytes (e.g. `mapping(bytes32 => bool)`
+keyed on the signature hash) is bypassable — an observer resubmits the other encoding of the same
+authorization for a distinct key. Do replay protection via **nonces or hash/digest invalidation**,
+never by tracking signature bytes. (OZ's own `ECDSA` NatSpec makes the same warning.) The Krystal vault
+automators are unaffected: they key cancellation/replay on the EIP-712 **digest**, not the signature.
