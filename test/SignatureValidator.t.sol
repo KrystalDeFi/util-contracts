@@ -354,6 +354,18 @@ contract SignatureValidatorTest is Test {
     // Raw ecrecover would accept and recover `wouldRecover`; our leg must reject via the low-s guard.
     assertFalse(SignatureValidator.isValidSignatureNow(wouldRecover, HASH, compact));
   }
+
+  // Length routing (verdict, not just no-revert): a non-6492 signature that is neither 65 nor 64 bytes
+  // (here 66) is routed to OZ tryRecover(bytes32,bytes), which returns InvalidSignatureLength → false —
+  // even though it begins with an otherwise-valid (r,s,v). Documents the "other length" branch.
+  function test_ecdsa_oddLengthSig_rejected() public view {
+    uint256 pk = 0xA11CE;
+    address eoa = vm.addr(pk);
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
+    bytes memory sig66 = abi.encodePacked(r, s, v, uint8(0)); // 66 bytes: valid (r,s,v) + one trailing byte
+    assertEq(sig66.length, 66);
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, sig66));
+  }
 }
 
 /// @dev CREATE2 factory that deploys a MockERC1271Wallet at a deterministic address. Counts deploy()
@@ -379,6 +391,14 @@ contract Mock6492Factory {
       )
     );
     return address(uint160(uint256(h)));
+  }
+}
+
+/// @dev A "factory" whose deploy call always reverts — used to prove the side-effects entry absorbs a
+///      reverting factory (best-effort deploy) instead of bubbling.
+contract RevertingFactory {
+  fallback() external {
+    revert("factory boom");
   }
 }
 
@@ -447,5 +467,20 @@ contract SignatureValidator6492Test is Test {
     assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(counterfactual, HASH, wrongWrapped));
     assertGt(counterfactual.code.length, 0); // the deploy DID happen — false is a validation miss, not a deploy miss
     assertEq(factory.deployCount(), 1); // factory was invoked exactly once
+  }
+
+  // A factory whose deploy call REVERTS must not bubble: the best-effort call absorbs the revert
+  // (success=false, discarded), the account stays undeployed, and validation returns false — no revert.
+  // Deterministic counterpart to what testFuzz_sideEffects_wrappedNeverReverts only reaches by chance.
+  function test_6492_sideEffects_revertingFactory_doesNotBubble_returnsFalse() public {
+    RevertingFactory badFactory = new RevertingFactory();
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, HASH); // even a "correct-key" inner still fails: no deploy
+    bytes memory inner = abi.encodePacked(r, s, v);
+    bytes memory wrapped = abi.encodePacked(
+      abi.encode(address(badFactory), bytes("deploy"), inner), SignatureValidator.ERC6492_DETECTION_SUFFIX
+    );
+    assertEq(counterfactual.code.length, 0);
+    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(counterfactual, HASH, wrapped));
+    assertEq(counterfactual.code.length, 0); // factory reverted → nothing deployed, and no bubble-up
   }
 }

@@ -68,11 +68,16 @@ from the (untrusted) signature, executed from the caller's own context, whenever
 code and `factory` is non-zero — before and independent of whether the signature ultimately
 validates. Treat it as an arbitrary-call / reentrancy primitive.
 
-> **Precondition (not advisory).** A consumer that calls `isValidSignatureNowWithSideEffects` **MUST**
-> gate it behind a reentrancy guard and **MUST NOT** hold funds, token approvals, or privileged roles
-> at the call site. Adopting it without both is a security defect in the consumer. Only pass signatures
-> from a trusted source. Prefer the view-only `isValidSignatureNow` unless counterfactual account
-> deployment is specifically required — the Krystal vault automators use only the view entry.
+> **Precondition (not advisory).** `isValidSignatureNowWithSideEffects` is inlined, so its
+> `factory.call(factoryCalldata)` runs **as the consumer** (`msg.sender == you`), with target and
+> calldata taken from the untrusted signature. An attacker can thus make the consumer call any contract
+> as itself — e.g. `factory = token; calldata = transfer(attacker, …)` drains the consumer's tokens in
+> a **single, non-reentrant call**, which a reentrancy guard does **not** stop. A consumer **MUST**
+> invoke it only from a context holding **no** funds, token approvals, or privileged roles, and only
+> with signatures from a trusted source. For fully-untrusted input, either use the view-only
+> `isValidSignatureNow` (staticcall-only, no CALL) or isolate the deploy in a stateless singleton (the
+> ERC-6492 reference `UniversalSigValidator` approach). The Krystal vault automators use only the view
+> entry, so this surface is not reachable in the shipped product.
 
 **ERC-1271 return data is bounded, and never reverts.** The ERC-1271 leg copies at most the first
 32-byte word of the signer's return data (via a bounded `staticcall`), so a malicious signer cannot

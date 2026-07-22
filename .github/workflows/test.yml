@@ -1,0 +1,52 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: forge test (OZ ${{ matrix.oz }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Validate the published @openzeppelin/contracts range (>=5.2.0 <6.0.0) at both ends: the
+        # declared floor and a current 5.x. The ECDSA leg depends on tryRecover(bytes32,bytes32,bytes32)
+        # (the EIP-2098 (r,vs) overload) and the (address, RecoverError, bytes32) 3-tuple return — this
+        # pins that both are stable across the whole supported range, not just the version we develop on.
+        oz: ["5.2.0", "5.6.1"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive # forge-std lives in lib/forge-std
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Pin @openzeppelin/contracts to the matrix version
+        env:
+          OZ_VERSION: ${{ matrix.oz }} # hardcoded matrix value, but pass via env as a hygiene default
+        run: npm install "@openzeppelin/contracts@${OZ_VERSION}" --no-save
+
+      - name: Assert the pinned OZ version is actually installed
+        env:
+          OZ_VERSION: ${{ matrix.oz }} # hardcoded matrix value; via env as a hygiene default
+        run: |
+          INSTALLED=$(node -e "console.log(require('@openzeppelin/contracts/package.json').version)")
+          echo "installed OZ: $INSTALLED (expected $OZ_VERSION)"
+          test "$INSTALLED" = "$OZ_VERSION" # fail loudly if the pin silently did not stick
+
+      - name: forge build
+        run: forge build --force
+
+      - name: forge test
+        run: forge test -vv

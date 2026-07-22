@@ -54,18 +54,26 @@ library SignatureValidator {
   ///         `factory` with `factoryCalldata` to deploy the account, then runs the dual-path check.
   ///         Never reverts on an invalid signature; returns false instead.
   /// @dev SECURITY: this makes an arbitrary external call `factory.call(factoryCalldata)` with BOTH the
-  ///      target and the calldata taken from the (untrusted) signature, executed from the CALLER's own
-  ///      context (this is an inlined internal library). It fires whenever `signer` has no code and
-  ///      `factory` is non-zero, BEFORE and INDEPENDENT of the validation result — a returned `false`
-  ///      is NOT a safety net. Treat it as an arbitrary-call / reentrancy primitive: callers MUST gate
-  ///      it behind a reentrancy guard, MUST NOT invoke it mid-operation while holding funds, approvals,
-  ///      or privileged roles, and should only pass signatures from a trusted source. The ERC-6492
-  ///      reference isolates this in a stateless singleton validator; this inlined form does not. Prefer
-  ///      `isValidSignatureNow` (view, no side effects) unless you specifically need counterfactual
-  ///      account deployment.
-  /// @custom:precondition A consumer that adopts this function MUST (not "should") call it behind a
-  ///      reentrancy guard and MUST NOT hold funds, token approvals, or privileged roles at the call
-  ///      site. Adopting it without both is a security defect in the consumer, not a hardening TODO.
+  ///      target and the calldata taken from the (untrusted) signature. Because this library is inlined,
+  ///      that call runs in the CONSUMER's own stack frame — the callee sees `msg.sender == the consumer`.
+  ///      An attacker signature can therefore set `factory`/`factoryCalldata` to ANY target+calldata and
+  ///      make the consumer call it AS ITSELF: e.g. `factory = someToken, factoryCalldata =
+  ///      transfer(attacker, balance)` drains the consumer's tokens/approvals in a SINGLE, non-reentrant
+  ///      call. It fires whenever `signer` has no code and `factory` is non-zero, BEFORE and INDEPENDENT
+  ///      of the validation result — a returned `false` is NOT a safety net. A REENTRANCY GUARD DOES NOT
+  ///      MITIGATE THIS (the drain is one outbound call, not re-entry). The only real mitigations are:
+  ///      (i) invoke it only from a context holding no funds, approvals, or privileged roles (a
+  ///      privilege-less call site), or (ii) isolate the deploy in a stateless singleton so the callee
+  ///      sees a privilege-less `msg.sender` (the ERC-6492 reference `UniversalSigValidator` approach;
+  ///      this inlined form deliberately trades that isolation away for a zero deployment dependency).
+  ///      Only pass signatures from a trusted source. Prefer the view-only `isValidSignatureNow`
+  ///      (staticcall-only, no CALL — safe with fully untrusted input) unless you specifically need
+  ///      counterfactual account deployment.
+  /// @custom:precondition A consumer that adopts this function MUST (not "should") invoke it only from a
+  ///      call site that holds NO funds, token approvals, or privileged roles — the untrusted signature
+  ///      can make the consumer perform an arbitrary call as itself (see @dev SECURITY). A reentrancy
+  ///      guard is hygiene but is NOT sufficient on its own. Adopting it from a privileged or
+  ///      fund-holding context is a security defect in the consumer, not a hardening TODO.
   function isValidSignatureNowWithSideEffects(address signer, bytes32 hash, bytes memory signature)
     internal
     returns (bool)
