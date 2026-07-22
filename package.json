@@ -1,6 +1,6 @@
 {
   "name": "@krystal/util-contracts",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Krystal utility smart contracts",
   "license": "MIT",
   "repository": "git@github.com:KrystalDeFi/util-contracts.git",

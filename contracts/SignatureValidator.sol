@@ -4,6 +4,14 @@ pragma solidity ^0.8.20;
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { IERC1271 } from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 
+/// @notice Interface of the stateless, privilege-less singleton that isolates the ERC-6492 deploy call.
+///         `SignatureValidator.isValidSignatureNowWithSideEffects` routes through an implementation of
+///         this so the untrusted `factory.call` runs as the singleton, not the consumer. See
+///         {SignatureValidatorSingleton}.
+interface ISignatureValidatorSingleton {
+  function isValidSigWithSideEffects(address signer, bytes32 hash, bytes calldata signature) external returns (bool);
+}
+
 /// @title SignatureValidator
 /// @notice Dual-path signature validation: a signature is accepted if EITHER an ERC-1271 check OR
 ///         an ECDSA recovery succeeds. Unlike OpenZeppelin/Solady `SignatureChecker`, which selects
@@ -11,7 +19,9 @@ import { IERC1271 } from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 ///         this library attempts BOTH. That is required for EIP-7702 accounts, which have contract
 ///         code AND a controlling EOA key: such an account may present a raw EOA signature (ECDSA
 ///         leg) or a signature its delegate validates via `isValidSignature` (ERC-1271 leg).
-///         ERC-6492 wrapped signatures are supported for counterfactual (not-yet-deployed) accounts.
+///         ERC-6492 wrapped signatures are supported for counterfactual (not-yet-deployed) accounts; the
+///         deploy (side-effects) step is isolated in a stateless singleton — see
+///         `isValidSignatureNowWithSideEffects` and {SignatureValidatorSingleton}.
 ///         NOTE: for an EIP-7702 signer, a valid signature from the account's root EOA key over `hash`
 ///         is accepted UNCONDITIONALLY via the ECDSA leg, OVERRIDING any restriction the account's own
 ///         `isValidSignature` would enforce (e.g. wrapped-digest replay protection, session-key scoping,
@@ -50,47 +60,27 @@ library SignatureValidator {
     return _dualCheck(signer, hash, sig);
   }
 
-  /// @notice NON-VIEW full ERC-6492. If `signature` is 6492-wrapped and `signer` has no code, calls
-  ///         `factory` with `factoryCalldata` to deploy the account, then runs the dual-path check.
-  ///         Never reverts on an invalid signature; returns false instead.
-  /// @dev SECURITY: this makes an arbitrary external call `factory.call(factoryCalldata)` with BOTH the
-  ///      target and the calldata taken from the (untrusted) signature. Because this library is inlined,
-  ///      that call runs in the CONSUMER's own stack frame — the callee sees `msg.sender == the consumer`.
-  ///      An attacker signature can therefore set `factory`/`factoryCalldata` to ANY target+calldata and
-  ///      make the consumer call it AS ITSELF: e.g. `factory = someToken, factoryCalldata =
-  ///      transfer(attacker, balance)` drains the consumer's tokens/approvals in a SINGLE, non-reentrant
-  ///      call. It fires whenever `signer` has no code and `factory` is non-zero, BEFORE and INDEPENDENT
-  ///      of the validation result — a returned `false` is NOT a safety net. A REENTRANCY GUARD DOES NOT
-  ///      MITIGATE THIS (the drain is one outbound call, not re-entry). The only real mitigations are:
-  ///      (i) invoke it only from a context holding no funds, approvals, or privileged roles (a
-  ///      privilege-less call site), or (ii) isolate the deploy in a stateless singleton so the callee
-  ///      sees a privilege-less `msg.sender` (the ERC-6492 reference `UniversalSigValidator` approach;
-  ///      this inlined form deliberately trades that isolation away for a zero deployment dependency).
-  ///      Only pass signatures from a trusted source. Prefer the view-only `isValidSignatureNow`
-  ///      (staticcall-only, no CALL — safe with fully untrusted input) unless you specifically need
-  ///      counterfactual account deployment.
-  /// @custom:precondition A consumer that adopts this function MUST (not "should") invoke it only from a
-  ///      call site that holds NO funds, token approvals, or privileged roles — the untrusted signature
-  ///      can make the consumer perform an arbitrary call as itself (see @dev SECURITY). A reentrancy
-  ///      guard is hygiene but is NOT sufficient on its own. Adopting it from a privileged or
-  ///      fund-holding context is a security defect in the consumer, not a hardening TODO.
-  function isValidSignatureNowWithSideEffects(address signer, bytes32 hash, bytes memory signature)
+  /// @notice NON-VIEW full ERC-6492 with SINGLETON ISOLATION. If `signature` is 6492-wrapped for a
+  ///         not-yet-deployed account, the `validator` singleton deploys it (in ITS OWN context) and then
+  ///         runs the dual-path check. Never reverts on an invalid signature; returns false instead.
+  /// @param validator A DEPLOYED {SignatureValidatorSingleton} (any `ISignatureValidatorSingleton`). The
+  ///        consumer supplies its address (deploy one per chain). It MUST be a trusted, stateless,
+  ///        privilege-less singleton — passing a non-deployed or wrong address is a consumer
+  ///        CONFIGURATION error and the external call may revert (this is distinct from the never-reverts
+  ///        guarantee, which concerns untrusted SIGNATURE input).
+  /// @dev SECURITY: the arbitrary `factory.call(factoryCalldata)` taken from the (untrusted) signature
+  ///      executes inside the SINGLETON's context — the callee sees `msg.sender == validator`, a
+  ///      privilege-less contract that holds no funds, approvals, or roles. This neutralizes the
+  ///      arbitrary-call-as-consumer drain of an inlined deploy (`factory = token; calldata =
+  ///      transfer(attacker, …)` can only act as the empty singleton). This is the ERC-6492 reference
+  ///      `UniversalSigValidator` isolation model. A returned `false` still means the dual-check failed;
+  ///      do not treat a deploy as proof of anything. Prefer the view-only `isValidSignatureNow`
+  ///      (staticcall-only, no CALL) unless you specifically need counterfactual account deployment.
+  function isValidSignatureNowWithSideEffects(address validator, address signer, bytes32 hash, bytes memory signature)
     internal
     returns (bool)
   {
-    if (signer == address(0)) return false;
-    bytes memory sig = signature;
-    if (_isERC6492(sig)) {
-      (bool okDecode, address factory, bytes memory factoryCalldata, bytes memory inner) = _tryDecodeERC6492(sig);
-      if (!okDecode) return false;
-      if (signer.code.length == 0 && factory != address(0)) {
-        // Best-effort deploy; result intentionally ignored — the dual-check below decides validity.
-        (bool success,) = factory.call(factoryCalldata);
-        success;
-      }
-      sig = inner;
-    }
-    return _dualCheck(signer, hash, sig);
+    return ISignatureValidatorSingleton(validator).isValidSigWithSideEffects(signer, hash, signature);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -142,7 +132,8 @@ library SignatureValidator {
     return word == bytes32(ERC1271_MAGIC_VALUE);
   }
 
-  function _isERC6492(bytes memory sig) private pure returns (bool) {
+  /// @dev Internal (not private): also consumed by {SignatureValidatorSingleton}.
+  function _isERC6492(bytes memory sig) internal pure returns (bool) {
     // A 6492 wrapper needs a 32-byte suffix plus at least a 96-byte ABI head; shorter inputs cannot be
     // 6492 wrappers. (Out-of-bounds offsets in a long-enough body are handled by _tryDecodeERC6492.)
     if (sig.length < 128) return false;
@@ -157,8 +148,9 @@ library SignatureValidator {
   ///      Returns ok=false (NEVER reverts) if the body is malformed — so a crafted signature cannot
   ///      force `abi.decode` to revert and break the "never reverts" contract. `sig` is assumed
   ///      6492-tagged with `sig.length >= 128` (guaranteed by `_isERC6492`).
+  /// @dev Internal (not private): also consumed by {SignatureValidatorSingleton} to extract the factory.
   function _tryDecodeERC6492(bytes memory sig)
-    private
+    internal
     pure
     returns (bool ok, address factory, bytes memory factoryCalldata, bytes memory inner)
   {

@@ -13,11 +13,13 @@ signatures for counterfactual accounts.
 ```solidity
 import { SignatureValidator } from "@krystal/util-contracts/contracts/SignatureValidator.sol";
 
-// view (no deploy): used by on-chain validators
+// view (no deploy, no external CALL): used by on-chain validators. Safe with untrusted input.
 SignatureValidator.isValidSignatureNow(signer, hash, signature);
 
-// non-view (deploys a counterfactual ERC-6492 account first):
-SignatureValidator.isValidSignatureNowWithSideEffects(signer, hash, signature);
+// non-view (deploys a counterfactual ERC-6492 account first). The deploy is isolated in a stateless
+// singleton — deploy ONE per chain and pass its address as `validator`:
+//   SignatureValidatorSingleton validator = new SignatureValidatorSingleton(); // once per chain
+SignatureValidator.isValidSignatureNowWithSideEffects(address(validator), signer, hash, signature);
 ```
 
 ### Install (consumers)
@@ -62,22 +64,23 @@ the account's own delegate `isValidSignature` would otherwise enforce (e.g. wrap
 protection, session-key scoping, 2FA). Consumers that rely on a 7702 account's own signature
 policy must account for this before adopting the dual-path check.
 
-**`isValidSignatureNowWithSideEffects` is an arbitrary-call surface.** This function makes an
-external call `factory.call(factoryCalldata)` where both the target and calldata come straight
-from the (untrusted) signature, executed from the caller's own context, whenever `signer` has no
-code and `factory` is non-zero — before and independent of whether the signature ultimately
-validates. Treat it as an arbitrary-call / reentrancy primitive.
+**`isValidSignatureNowWithSideEffects` deploys via an isolated singleton.** The ERC-6492 factory
+call (`factory.call(factoryCalldata)`, target + calldata from the untrusted signature) is executed
+inside the `validator` singleton's context — the callee sees `msg.sender == the singleton`, a
+stateless, privilege-less contract that holds no funds, approvals, or roles. This is the ERC-6492
+reference `UniversalSigValidator` isolation model, and it removes the *drain* vector an inlined
+deploy would expose (`factory = token; calldata = transfer(attacker, …)` can only act as the empty
+singleton — there is nothing to take).
 
-> **Precondition (not advisory).** `isValidSignatureNowWithSideEffects` is inlined, so its
-> `factory.call(factoryCalldata)` runs **as the consumer** (`msg.sender == you`), with target and
-> calldata taken from the untrusted signature. An attacker can thus make the consumer call any contract
-> as itself — e.g. `factory = token; calldata = transfer(attacker, …)` drains the consumer's tokens in
-> a **single, non-reentrant call**, which a reentrancy guard does **not** stop. A consumer **MUST**
-> invoke it only from a context holding **no** funds, token approvals, or privileged roles, and only
-> with signatures from a trusted source. For fully-untrusted input, either use the view-only
-> `isValidSignatureNow` (staticcall-only, no CALL) or isolate the deploy in a stateless singleton (the
-> ERC-6492 reference `UniversalSigValidator` approach). The Krystal vault automators use only the view
-> entry, so this surface is not reachable in the shipped product.
+> **Precondition (not advisory).** Two obligations remain for `isValidSignatureNowWithSideEffects`:
+> **(1)** `validator` **MUST** be a deployed, trusted `SignatureValidatorSingleton` that is kept
+> stateless and privilege-less — never grant it roles/approvals or let it hold a balance (that empties
+> the isolation). **(2)** The attacker-controlled factory call (running as the singleton) can still
+> **re-enter the consumer**, so a consumer that calls this while holding funds/roles **MUST** gate the
+> call behind a reentrancy guard. Singleton isolation defeats the single-call *drain*; it does not by
+> itself defeat *re-entry*. Prefer the view-only `isValidSignatureNow` (no CALL at all) for
+> fully-untrusted input. The Krystal vault automators use only the view entry, so this surface is not
+> reachable in the shipped product.
 
 **ERC-1271 return data is bounded, and never reverts.** The ERC-1271 leg copies at most the first
 32-byte word of the signer's return data (via a bounded `staticcall`), so a malicious signer cannot

@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import { Test } from "forge-std/Test.sol";
 import { SignatureValidator } from "../contracts/SignatureValidator.sol";
+import { SignatureValidatorSingleton } from "../contracts/SignatureValidatorSingleton.sol";
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
@@ -77,6 +78,12 @@ contract MockWrapped7702Wallet {
 
 contract SignatureValidatorTest is Test {
   bytes32 constant HASH = keccak256("krystal-order-digest");
+
+  SignatureValidatorSingleton singleton;
+
+  function setUp() public {
+    singleton = new SignatureValidatorSingleton();
+  }
 
   function test_eoa_rawSig_valid() public view {
     uint256 pk = 0xA11CE;
@@ -169,7 +176,7 @@ contract SignatureValidatorTest is Test {
     address eoa = vm.addr(0xA11CE);
     bytes memory malformed =
       abi.encodePacked(bytes32(0), bytes32(uint256(4096)), bytes32(0), SignatureValidator.ERC6492_DETECTION_SUFFIX);
-    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, malformed));
+    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), eoa, HASH, malformed));
   }
 
   // HIGH-1 (guard-2): in-bounds offset but a length word larger than the remaining body → false, no revert.
@@ -210,7 +217,7 @@ contract SignatureValidatorTest is Test {
   function testFuzz_isValidSignatureNowWithSideEffects_neverReverts(address signer, bytes32 hash, bytes memory sig)
     public
   {
-    SignatureValidator.isValidSignatureNowWithSideEffects(signer, hash, sig); // must return (not revert)
+    SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), signer, hash, sig); // must return (not revert)
   }
 
   // Never-reverts when the side-effects entry ACTUALLY fires `factory.call(factoryCalldata)`: build a
@@ -228,7 +235,7 @@ contract SignatureValidatorTest is Test {
     vm.assume(factory != address(vm));
     bytes memory wrapped =
       abi.encodePacked(abi.encode(factory, factoryCalldata, inner), SignatureValidator.ERC6492_DETECTION_SUFFIX);
-    SignatureValidator.isValidSignatureNowWithSideEffects(signer, hash, wrapped); // must return (not revert)
+    SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), signer, hash, wrapped); // must return (not revert)
   }
 
   // Malleability: the high-s counterpart of a valid signature must be rejected (OZ tryRecover guards
@@ -290,7 +297,9 @@ contract SignatureValidatorTest is Test {
     uint256 pk = 0xA11CE;
     address eoa = vm.addr(pk);
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
-    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, abi.encodePacked(r, s, v)));
+    assertTrue(
+      SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), eoa, HASH, abi.encodePacked(r, s, v))
+    );
   }
 
   // Side-effects entry, NON-6492 signature (contract wallet): signer has code, not 6492-tagged → the
@@ -299,7 +308,11 @@ contract SignatureValidatorTest is Test {
     uint256 pk = 0xC0FFEE;
     MockERC1271Wallet w = new MockERC1271Wallet(vm.addr(pk));
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
-    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(address(w), HASH, abi.encodePacked(r, s, v)));
+    assertTrue(
+      SignatureValidator.isValidSignatureNowWithSideEffects(
+        address(singleton), address(w), HASH, abi.encodePacked(r, s, v)
+      )
+    );
   }
 
   // EIP-2098 compact (64-byte) signatures ARE accepted: the ECDSA leg routes a 64-byte input through
@@ -315,7 +328,7 @@ contract SignatureValidatorTest is Test {
     // The same key's 65-byte form is also valid — the compact form is just a re-encoding.
     assertTrue(SignatureValidator.isValidSignatureNow(eoa, HASH, abi.encodePacked(r, s, v)));
     assertTrue(SignatureValidator.isValidSignatureNow(eoa, HASH, compact));
-    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, compact));
+    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), eoa, HASH, compact));
   }
 
   // A 64-byte compact signature by the WRONG key must be rejected (recovers a different address).
@@ -335,7 +348,7 @@ contract SignatureValidatorTest is Test {
     bytes32 vs = bytes32((uint256(v - 27) << 255) | uint256(s));
     bytes memory compact = abi.encodePacked(r, vs);
     assertEq(compact.length, 64);
-    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, compact));
+    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), eoa, HASH, compact));
   }
 
   // Malleability on the compact path: a 64-byte sig whose decoded `s` lies in the encodable malleable
@@ -402,17 +415,29 @@ contract RevertingFactory {
   }
 }
 
+/// @dev Records `msg.sender` of the factory call — used to prove the deploy runs AS the singleton, not
+///      the consumer (the whole point of singleton isolation).
+contract MsgSenderRecorder {
+  address public lastCaller;
+
+  fallback() external {
+    lastCaller = msg.sender;
+  }
+}
+
 contract SignatureValidator6492Test is Test {
   bytes32 constant HASH = keccak256("krystal-order-digest");
   bytes32 constant SALT = bytes32(uint256(1));
 
   Mock6492Factory factory;
+  SignatureValidatorSingleton singleton;
   uint256 ownerPk = 0xC0FFEE;
   address counterfactual;
   bytes wrappedSig;
 
   function setUp() public {
     factory = new Mock6492Factory();
+    singleton = new SignatureValidatorSingleton();
     counterfactual = factory.predict(SALT, vm.addr(ownerPk));
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, HASH);
     bytes memory inner = abi.encodePacked(r, s, v);
@@ -429,7 +454,9 @@ contract SignatureValidator6492Test is Test {
 
   function test_6492_sideEffects_deploysAndValidates() public {
     assertEq(counterfactual.code.length, 0);
-    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(counterfactual, HASH, wrappedSig));
+    assertTrue(
+      SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), counterfactual, HASH, wrappedSig)
+    );
     assertGt(counterfactual.code.length, 0); // factory deployed it
   }
 
@@ -447,7 +474,9 @@ contract SignatureValidator6492Test is Test {
     factory.deploy(SALT, vm.addr(ownerPk)); // account now exists (deployCount -> 1)
     assertGt(counterfactual.code.length, 0);
     uint256 deploysBefore = factory.deployCount();
-    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(counterfactual, HASH, wrappedSig));
+    assertTrue(
+      SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), counterfactual, HASH, wrappedSig)
+    );
     assertEq(factory.deployCount(), deploysBefore); // factory NOT called: deploy skipped for a coded signer
   }
 
@@ -464,7 +493,9 @@ contract SignatureValidator6492Test is Test {
       abi.encode(address(factory), factoryCalldata, badInner), SignatureValidator.ERC6492_DETECTION_SUFFIX
     );
     assertEq(counterfactual.code.length, 0);
-    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(counterfactual, HASH, wrongWrapped));
+    assertFalse(
+      SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), counterfactual, HASH, wrongWrapped)
+    );
     assertGt(counterfactual.code.length, 0); // the deploy DID happen — false is a validation miss, not a deploy miss
     assertEq(factory.deployCount(), 1); // factory was invoked exactly once
   }
@@ -472,6 +503,23 @@ contract SignatureValidator6492Test is Test {
   // A factory whose deploy call REVERTS must not bubble: the best-effort call absorbs the revert
   // (success=false, discarded), the account stays undeployed, and validation returns false — no revert.
   // Deterministic counterpart to what testFuzz_sideEffects_wrappedNeverReverts only reaches by chance.
+  // ISOLATION (the point of the singleton): the untrusted factory call runs AS the singleton, never as
+  // the consumer/caller. A recorder factory captures msg.sender; it MUST be the singleton address, NOT
+  // this test contract. Under the old inlined form (factory.call in the caller's frame) msg.sender would
+  // be address(this) — so this assertion is load-bearing proof that the isolation holds.
+  function test_6492_sideEffects_factoryCallRunsAsSingleton_notCaller() public {
+    MsgSenderRecorder recorder = new MsgSenderRecorder();
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, HASH);
+    bytes memory inner = abi.encodePacked(r, s, v);
+    bytes memory wrapped = abi.encodePacked(
+      abi.encode(address(recorder), bytes("deploy"), inner), SignatureValidator.ERC6492_DETECTION_SUFFIX
+    );
+    assertEq(counterfactual.code.length, 0); // signer has no code -> the factory (recorder) call fires
+    SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), counterfactual, HASH, wrapped);
+    assertEq(recorder.lastCaller(), address(singleton)); // ran as the privilege-less singleton...
+    assertTrue(recorder.lastCaller() != address(this)); // ...NOT as the consumer/caller
+  }
+
   function test_6492_sideEffects_revertingFactory_doesNotBubble_returnsFalse() public {
     RevertingFactory badFactory = new RevertingFactory();
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, HASH); // even a "correct-key" inner still fails: no deploy
@@ -480,7 +528,9 @@ contract SignatureValidator6492Test is Test {
       abi.encode(address(badFactory), bytes("deploy"), inner), SignatureValidator.ERC6492_DETECTION_SUFFIX
     );
     assertEq(counterfactual.code.length, 0);
-    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(counterfactual, HASH, wrapped));
+    assertFalse(
+      SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), counterfactual, HASH, wrapped)
+    );
     assertEq(counterfactual.code.length, 0); // factory reverted → nothing deployed, and no bubble-up
   }
 }
