@@ -43,8 +43,10 @@ npm install && forge test -vvv
 compact `(r,vs)` signatures. A 64-byte input is routed through OZ `ECDSA.tryRecover(bytes32,bytes32,bytes32)`
 (the `(r,vs)` overload); anything else through `ECDSA.tryRecover(bytes32,bytes)`. Both overloads
 enforce low-s malleability rejection and signal errors via a `RecoverError` return rather than
-reverting. (Compact form is also structurally non-malleable: the high-s twin `N - s` exceeds 2^255
-and cannot be encoded in the `vs` field.) The library targets the OZ 5.x `ECDSA` API — the
+reverting. (On malleability of the compact form: the `vs` field only encodes `s < 2^255`, which alone
+blocks the high-s window `[2^255, N)`; the remaining malleable values `s ∈ (N/2, 2^255)` *are*
+encodable but are rejected by OZ's low-s guard — see `test_ecdsa_64byteCompactSig_highS_rejected`,
+which exercises `s = N/2 + 1`.) The library targets the OZ 5.x `ECDSA` API — the
 `tryRecover` overloads and the `RecoverError` 3-tuple return — and pins `<6.0.0` for API stability
 across that audited line.
 

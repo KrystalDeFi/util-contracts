@@ -204,6 +204,33 @@ contract SignatureValidatorTest is Test {
     SignatureValidator.isValidSignatureNow(signer, hash, sig); // must return (not revert)
   }
 
+  // Never-reverts on the SIDE-EFFECTS entry, arbitrary input (mirrors the view fuzz). Random `sig` almost
+  // never forms a 6492 wrapper (it must end in the exact 32-byte magic suffix), so this locks the
+  // non-6492 path of the side-effects entry; the wrapped fuzz below covers the factory.call path.
+  function testFuzz_isValidSignatureNowWithSideEffects_neverReverts(address signer, bytes32 hash, bytes memory sig)
+    public
+  {
+    SignatureValidator.isValidSignatureNowWithSideEffects(signer, hash, sig); // must return (not revert)
+  }
+
+  // Never-reverts when the side-effects entry ACTUALLY fires `factory.call(factoryCalldata)`: build a
+  // genuine 6492 wrapper from fuzzed factory/calldata/inner so the arbitrary external call executes with
+  // attacker-controlled target and calldata. The verdict is irrelevant — the property under test is
+  // "never reverts". Exclude the Forge cheatcode address so a fluke selector match can't perturb the run
+  // (a returned false from any other target is absorbed by the best-effort call).
+  function testFuzz_sideEffects_wrappedNeverReverts(
+    address factory,
+    bytes memory factoryCalldata,
+    bytes memory inner,
+    address signer,
+    bytes32 hash
+  ) public {
+    vm.assume(factory != address(vm));
+    bytes memory wrapped =
+      abi.encodePacked(abi.encode(factory, factoryCalldata, inner), SignatureValidator.ERC6492_DETECTION_SUFFIX);
+    SignatureValidator.isValidSignatureNowWithSideEffects(signer, hash, wrapped); // must return (not revert)
+  }
+
   // Malleability: the high-s counterpart of a valid signature must be rejected (OZ tryRecover guards
   // high-s and v). Locks this behavior against a future dependency swap.
   function test_ecdsa_highSMalleable_rejected() public view {

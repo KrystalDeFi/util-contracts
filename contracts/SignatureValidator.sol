@@ -187,6 +187,11 @@ library SignatureValidator {
 
   /// @dev Reads a `bytes` field located at `off` within the `bodyLen`-byte region starting at memory
   ///      pointer `base`, with full bounds checks. Returns ok=false (no revert) on any inconsistency.
+  ///      INVARIANT: bytes beyond `len` in the final word of `out` MAY BE DIRTY — the word-copy below
+  ///      overwrites the zero-padding that `new bytes(len)` created with adjacent source bytes. Every
+  ///      current consumer reads `out` by length only (`factory.call` uses the exact length,
+  ///      `abi.encodeCall` re-pads by length, the ECDSA leg reads fixed offsets), so this is unobserved.
+  ///      A future consumer that hashes or full-word-compares `out` MUST NOT rely on clean tail padding.
   function _readTailBytes(uint256 base, uint256 bodyLen, uint256 off) private pure returns (bool ok, bytes memory out) {
     // length word must be fully in-bounds: off + 32 <= bodyLen (overflow-safe form)
     if (off > bodyLen || bodyLen - off < 0x20) return (false, "");
