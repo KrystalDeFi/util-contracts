@@ -83,8 +83,24 @@ library SignatureValidator {
   function _dualCheck(address signer, bytes32 hash, bytes memory sig) private view returns (bool) {
     // Leg 1: ERC-1271 (only meaningful when the signer has code).
     if (signer.code.length != 0 && _isValidERC1271(signer, hash, sig)) return true;
-    // Leg 2: ECDSA — attempted EVEN when the signer has code (the EIP-7702 case).
-    (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, sig);
+    // Leg 2: ECDSA — attempted EVEN when the signer has code (the EIP-7702 case). Accepts both a
+    // 65-byte (r,s,v) signature and a 64-byte EIP-2098 compact (r,vs) signature; a 64-byte input is
+    // routed through OZ's (r,vs) overload. Both overloads enforce low-s malleability rejection and
+    // signal failure via RecoverError (they never revert).
+    address recovered;
+    ECDSA.RecoverError err;
+    if (sig.length == 64) {
+      bytes32 r;
+      bytes32 vs;
+      assembly ("memory-safe") {
+        // A 64-byte `bytes memory` holds exactly r || vs in its data region [sig+0x20, sig+0x60).
+        r := mload(add(sig, 0x20))
+        vs := mload(add(sig, 0x40))
+      }
+      (recovered, err,) = ECDSA.tryRecover(hash, r, vs);
+    } else {
+      (recovered, err,) = ECDSA.tryRecover(hash, sig);
+    }
     return err == ECDSA.RecoverError.NoError && recovered == signer;
   }
 

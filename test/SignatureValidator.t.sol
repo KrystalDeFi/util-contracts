@@ -275,18 +275,30 @@ contract SignatureValidatorTest is Test {
     assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(address(w), HASH, abi.encodePacked(r, s, v)));
   }
 
-  // EIP-2098 compact (64-byte) signatures are NOT accepted: the ECDSA leg calls OZ
-  // tryRecover(bytes32,bytes), which is 65-byte-only across all supported OZ 5.x (compact sigs use a
-  // separate (r,vs) overload the library never calls). Must return false via both entries, no revert.
-  function test_ecdsa_64byteCompactSig_rejected() public {
+  // EIP-2098 compact (64-byte) signatures ARE accepted: the ECDSA leg routes a 64-byte input through
+  // OZ tryRecover(bytes32, r, vs), which decodes the compact form and enforces low-s. Accepted via both
+  // entries (view + side-effects), matching the 65-byte (r,s,v) verdict for the same key.
+  function test_ecdsa_64byteCompactSig_accepted() public {
     uint256 pk = 0xA11CE;
     address eoa = vm.addr(pk);
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
     bytes32 vs = bytes32((uint256(v - 27) << 255) | uint256(s)); // EIP-2098: yParity in the top bit of s
     bytes memory compact = abi.encodePacked(r, vs);
     assertEq(compact.length, 64);
+    // The same key's 65-byte form is also valid — the compact form is just a re-encoding.
+    assertTrue(SignatureValidator.isValidSignatureNow(eoa, HASH, abi.encodePacked(r, s, v)));
+    assertTrue(SignatureValidator.isValidSignatureNow(eoa, HASH, compact));
+    assertTrue(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, compact));
+  }
+
+  // A 64-byte compact signature by the WRONG key must be rejected (recovers a different address).
+  function test_ecdsa_64byteCompactSig_wrongKey_invalid() public view {
+    address eoa = vm.addr(0xA11CE);
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xBEEF, HASH); // signed by a different key
+    bytes32 vs = bytes32((uint256(v - 27) << 255) | uint256(s));
+    bytes memory compact = abi.encodePacked(r, vs);
+    assertEq(compact.length, 64);
     assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, compact));
-    assertFalse(SignatureValidator.isValidSignatureNowWithSideEffects(eoa, HASH, compact));
   }
 }
 

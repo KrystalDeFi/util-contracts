@@ -39,14 +39,14 @@ npm install && forge test -vvv
 
 ## Compatibility
 
-**ECDSA signature length.** The ECDSA leg uses OZ `ECDSA.tryRecover(bytes32,bytes)`, which accepts
-only 65-byte `(r,s,v)` signatures across the entire supported OZ 5.x range (EIP-2098 64-byte
-compact signatures use OZ's separate `(r,vs)` overload, which this library does not call).
-Behavior is therefore consistent across OZ 5.x — the ECDSA leg is deterministic regardless of the
-consumer's 5.x minor version. OZ marks that overload's 65-byte-only restriction as deprecated and
-slated for removal in v6.0 — i.e. in v6.0 `tryRecover(bytes32,bytes)` will begin accepting 64-byte
-EIP-2098 compact signatures. To keep the deterministic 65-byte-only behavior this library relies on,
-it pins OZ `<6.0.0`.
+**ECDSA signature formats.** The ECDSA leg accepts both 65-byte `(r,s,v)` and 64-byte EIP-2098
+compact `(r,vs)` signatures. A 64-byte input is routed through OZ `ECDSA.tryRecover(bytes32,bytes32,bytes32)`
+(the `(r,vs)` overload); anything else through `ECDSA.tryRecover(bytes32,bytes)`. Both overloads
+enforce low-s malleability rejection and signal errors via a `RecoverError` return rather than
+reverting. (Compact form is also structurally non-malleable: the high-s twin `N - s` exceeds 2^255
+and cannot be encoded in the `vs` field.) The library targets the OZ 5.x `ECDSA` API — the
+`tryRecover` overloads and the `RecoverError` 3-tuple return — and pins `<6.0.0` for API stability
+across that audited line.
 
 **EVM version.** Compiled/tested at `evm_version = cancun` (uses PUSH0). Since the library is
 inlined, the consumer's compiler settings govern deployment — consumers targeting pre-PUSH0 /
