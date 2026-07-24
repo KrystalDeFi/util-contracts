@@ -379,6 +379,51 @@ contract SignatureValidatorTest is Test {
     assertEq(sig66.length, 66);
     assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, sig66));
   }
+
+  // Differential fuzz: the ECDSA leg must agree with OpenZeppelin's ECDSA.tryRecover for every
+  // well-formed signature, in both 65-byte (r,s,v) and 64-byte EIP-2098 (r,vs) encodings. vm.sign
+  // yields a canonical (low-s, v in {27,28}) signature, so OZ validates it and so must we.
+  function testFuzz_ecdsa_matchesOZ(uint256 pkSeed, bytes32 hash) public view {
+    // secp256k1 order N; bound the key to [1, N-1] so vm.sign gets a valid private key.
+    uint256 pk = bound(pkSeed, 1, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140);
+    address signer = vm.addr(pk);
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, hash);
+
+    bytes memory sig65 = abi.encodePacked(r, s, v);
+    (address ozRec, ECDSA.RecoverError ozErr,) = ECDSA.tryRecover(hash, sig65);
+    bool ozValid = ozErr == ECDSA.RecoverError.NoError && ozRec == signer;
+    assertTrue(ozValid); // canonical signature: OZ always accepts
+    assertEq(SignatureValidator.isValidSignatureNow(signer, hash, sig65), ozValid);
+
+    // Same signature re-encoded as EIP-2098 compact form must match too.
+    bytes32 vs = bytes32((uint256(v - 27) << 255) | uint256(s));
+    assertEq(SignatureValidator.isValidSignatureNow(signer, hash, abi.encodePacked(r, vs)), ozValid);
+  }
+
+  // Differential fuzz across the malleability boundary: the malleated (high-s, flipped-v) form of any
+  // valid signature must be rejected by BOTH the library and OZ, proving the low-s guard matches OZ.
+  function testFuzz_ecdsa_malleated_matchesOZ(uint256 pkSeed, bytes32 hash) public view {
+    uint256 pk = bound(pkSeed, 1, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140);
+    address signer = vm.addr(pk);
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, hash);
+
+    uint256 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141; // secp256k1 order N
+    bytes memory malleated = abi.encodePacked(r, bytes32(n - uint256(s)), v == 27 ? uint8(28) : uint8(27));
+    (address ozRec, ECDSA.RecoverError ozErr,) = ECDSA.tryRecover(hash, malleated);
+    bool ozValid = ozErr == ECDSA.RecoverError.NoError && ozRec == signer;
+    assertFalse(ozValid); // OZ rejects upper-half s
+    assertEq(SignatureValidator.isValidSignatureNow(signer, hash, malleated), ozValid);
+  }
+
+  // Raw legacy v in {0,1} (not 27/28) must be rejected: ecrecover yields address(0) for such v. Both OZ
+  // and the inline leg rely on that address(0) result, so neither validates the signature.
+  function test_ecdsa_rawLegacyV_rejected() public view {
+    uint256 pk = 0xA11CE;
+    address eoa = vm.addr(pk);
+    (, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, abi.encodePacked(r, s, uint8(0))));
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, abi.encodePacked(r, s, uint8(1))));
+  }
 }
 
 /// @dev CREATE2 factory that deploys a MockERC1271Wallet at a deterministic address. Counts deploy()
