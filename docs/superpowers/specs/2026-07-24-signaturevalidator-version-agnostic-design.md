@@ -56,8 +56,11 @@ Approaches considered and rejected:
 ## Changes
 
 ### 1. `contracts/SignatureValidator.sol`
-- Pragma `^0.8.20` → `^0.8.0`. (Proven safe: v3utils already compiles byte-identical code on 0.8.15; all
-  language features used, including `assembly ("memory-safe")`, are ≥0.8.13-safe.)
+- Pragma `^0.8.20` → `^0.8.15`. (Truthful floor, verified by build: solc 0.8.13 FAILS — `abi.encodeCall`
+  won't implicitly convert the `bytes memory` arg to the interface's `bytes calldata` until 0.8.14, and
+  `assembly ("memory-safe")` needs ≥0.8.13 — so the real minimum is 0.8.14; `^0.8.15` is chosen because
+  0.8.15 is v3utils's actual solc and is the lowest version the tri-toolchain CI build exercises, so every
+  advertised version is guarded.)
 - Remove `import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";`.
 - Keep `import { IERC1271 } from "@openzeppelin/contracts/interfaces/IERC1271.sol";` (stable across OZ
   4.9/5.x).
@@ -77,7 +80,9 @@ Approaches considered and rejected:
 - No behavioral change to the ERC-1271 leg, ERC-6492 decode, or the never-reverts contract.
 
 ### 2. `contracts/SignatureValidatorSingleton.sol`
-- Pragma `^0.8.20` → `^0.8.0` only. No OZ ECDSA usage (imports only the local `SignatureValidator`).
+- Pragma `^0.8.20` → `^0.8.15` (same floor as the library — it inlines the library's memory-safe
+  assembly, so it cannot compile below 0.8.14 either). No OZ ECDSA usage (imports only the local
+  `SignatureValidator`).
 
 ### 3. Package metadata
 - `package.json`: relax `@openzeppelin/contracts` from `>=5.2.0 <6.0.0` to `>=4.9.0 <6.0.0` — only
