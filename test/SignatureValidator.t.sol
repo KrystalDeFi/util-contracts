@@ -238,15 +238,15 @@ contract SignatureValidatorTest is Test {
     SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), signer, hash, wrapped); // must return (not revert)
   }
 
-  // Malleability: the high-s counterpart of a valid signature must be rejected (OZ tryRecover guards
-  // high-s and v). Locks this behavior against a future dependency swap.
+  // Malleability: the high-s counterpart of a valid signature must be rejected (the inline
+  // `_recover` enforces low-s). Locks this behavior against a future dependency swap.
   function test_ecdsa_highSMalleable_rejected() public view {
     uint256 pk = 0xA11CE;
     address eoa = vm.addr(pk);
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
     uint256 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141; // secp256k1 curve order N
     // With the correct N, highS = n - s lands in (N/2, N): an s-value the raw ecrecover precompile
-    // ACCEPTS (s < N) but OZ's malleability guard REJECTS (s > N/2) — so assertFalse below genuinely
+    // ACCEPTS (s < N) but the inline `_recover`'s low-s guard REJECTS (s > N/2) — so assertFalse below genuinely
     // proves the guard fires, rather than the signature merely being out of ecrecover's own s<N bound.
     bytes32 highS = bytes32(n - uint256(s));
     uint8 flippedV = v == 27 ? 28 : 27;
@@ -315,9 +315,9 @@ contract SignatureValidatorTest is Test {
     );
   }
 
-  // EIP-2098 compact (64-byte) signatures ARE accepted: the ECDSA leg routes a 64-byte input through
-  // OZ tryRecover(bytes32, r, vs), which decodes the compact form and enforces low-s. Accepted via both
-  // entries (view + side-effects), matching the 65-byte (r,s,v) verdict for the same key.
+  // EIP-2098 compact (64-byte) signatures ARE accepted: the ECDSA leg's inline `_recover` decodes
+  // the 64-byte EIP-2098 (r,vs) compact form and enforces low-s. Accepted via both entries
+  // (view + side-effects), matching the 65-byte (r,s,v) verdict for the same key.
   function test_ecdsa_64byteCompactSig_accepted() public {
     uint256 pk = 0xA11CE;
     address eoa = vm.addr(pk);
@@ -352,7 +352,7 @@ contract SignatureValidatorTest is Test {
   }
 
   // Malleability on the compact path: a 64-byte sig whose decoded `s` lies in the encodable malleable
-  // window (N/2, 2^255) must be rejected by OZ's low-s guard — even though the raw ecrecover precompile
+  // window (N/2, 2^255) must be rejected by the inline `_recover`'s low-s guard — even though the raw ecrecover precompile
   // ACCEPTS it and recovers a concrete address. Load-bearing: we assert the very address raw ecrecover
   // yields is NOT validated, so the false verdict proves the guard fired (not a mere wrong-signer miss).
   // Mirrors test_ecdsa_highSMalleable_rejected on the compact (r,vs) path.
@@ -369,7 +369,7 @@ contract SignatureValidatorTest is Test {
   }
 
   // Length routing (verdict, not just no-revert): a non-6492 signature that is neither 65 nor 64 bytes
-  // (here 66) is routed to OZ tryRecover(bytes32,bytes), which returns InvalidSignatureLength → false —
+  // (here 66) returns false via the inline `_recover`, which rejects any length other than 65 or 64 —
   // even though it begins with an otherwise-valid (r,s,v). Documents the "other length" branch.
   function test_ecdsa_oddLengthSig_rejected() public view {
     uint256 pk = 0xA11CE;
