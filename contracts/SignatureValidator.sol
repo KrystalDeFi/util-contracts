@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.15;
 
-import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { IERC1271 } from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 
 /// @notice Interface of the stateless, privilege-less singleton that isolates the ERC-6492 deploy call.
@@ -90,25 +89,53 @@ library SignatureValidator {
   function _dualCheck(address signer, bytes32 hash, bytes memory sig) private view returns (bool) {
     // Leg 1: ERC-1271 (only meaningful when the signer has code).
     if (signer.code.length != 0 && _isValidERC1271(signer, hash, sig)) return true;
-    // Leg 2: ECDSA — attempted EVEN when the signer has code (the EIP-7702 case). Accepts both a
-    // 65-byte (r,s,v) signature and a 64-byte EIP-2098 compact (r,vs) signature; a 64-byte input is
-    // routed through OZ's (r,vs) overload. Both overloads enforce low-s malleability rejection and
-    // signal failure via RecoverError (they never revert).
-    address recovered;
-    ECDSA.RecoverError err;
-    if (sig.length == 64) {
-      bytes32 r;
+    // Leg 2: ECDSA — attempted EVEN when the signer has code (the EIP-7702 case). Delegates to _recover
+    // (inlined ECDSA, matching OpenZeppelin ECDSA.tryRecover): accepts a 65-byte (r,s,v) signature and a
+    // 64-byte EIP-2098 compact (r,vs) signature, enforces low-s malleability rejection, and never reverts
+    // (any invalid input recovers address(0)).
+    address recovered = _recover(hash, sig);
+    // `signer` is guaranteed non-zero by isValidSignatureNow's entry guard, so a zero `recovered` (the
+    // failure sentinel) can never spuriously match; the explicit check keeps the intent local.
+    return recovered != address(0) && recovered == signer;
+  }
+
+  /// @dev secp256k1n ÷ 2 — the upper bound of the canonical (low-s) range. Copied verbatim from
+  ///      OpenZeppelin's ECDSA to preserve identical malleability rejection.
+  uint256 private constant _HALF_CURVE_ORDER = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
+
+  /// @dev Inlined ECDSA recovery matching OpenZeppelin `ECDSA.tryRecover`, so the library no longer
+  ///      depends on OZ's `ECDSA` (whose `tryRecover` return arity differs between OZ 4.9 and 5.x and
+  ///      is the sole obstacle to compiling under both toolchains). Accepts only a 65-byte `(r,s,v)`
+  ///      signature or a 64-byte EIP-2098 `(r,vs)` compact signature; rejects an upper-half `s`
+  ///      (malleability) and treats a zero `ecrecover` result (invalid `v`/signature) as failure. Returns
+  ///      `address(0)` on any failure and NEVER reverts — preserving the library's never-reverts contract.
+  function _recover(bytes32 hash, bytes memory sig) private pure returns (address) {
+    bytes32 r;
+    bytes32 s;
+    uint8 v;
+    if (sig.length == 65) {
+      assembly ("memory-safe") {
+        r := mload(add(sig, 0x20))
+        s := mload(add(sig, 0x40))
+        v := byte(0, mload(add(sig, 0x60)))
+      }
+    } else if (sig.length == 64) {
       bytes32 vs;
       assembly ("memory-safe") {
         // A 64-byte `bytes memory` holds exactly r || vs in its data region [sig+0x20, sig+0x60).
         r := mload(add(sig, 0x20))
         vs := mload(add(sig, 0x40))
       }
-      (recovered, err,) = ECDSA.tryRecover(hash, r, vs);
+      // EIP-2098: `s` is `vs` with the top bit cleared; `v` is 27 + that top (yParity) bit.
+      s = vs & bytes32(0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+      v = uint8((uint256(vs) >> 255) + 27);
     } else {
-      (recovered, err,) = ECDSA.tryRecover(hash, sig);
+      return address(0); // any other length is not a supported ECDSA encoding
     }
-    return err == ECDSA.RecoverError.NoError && recovered == signer;
+    // Reject upper-half `s` (signature malleability), matching OZ's low-s guard.
+    if (uint256(s) > _HALF_CURVE_ORDER) return address(0);
+    // `ecrecover` returns address(0) for an invalid `v` (not 27/28) or an unrecoverable signature.
+    return ecrecover(hash, v, r, s);
   }
 
   /// @dev ERC-1271 leg. Two properties over the plain `staticcall` + `abi.decode(ret,(bytes4))` form:

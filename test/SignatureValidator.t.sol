@@ -238,15 +238,15 @@ contract SignatureValidatorTest is Test {
     SignatureValidator.isValidSignatureNowWithSideEffects(address(singleton), signer, hash, wrapped); // must return (not revert)
   }
 
-  // Malleability: the high-s counterpart of a valid signature must be rejected (OZ tryRecover guards
-  // high-s and v). Locks this behavior against a future dependency swap.
+  // Malleability: the high-s counterpart of a valid signature must be rejected (the inline
+  // `_recover` enforces low-s). Locks this behavior against a future dependency swap.
   function test_ecdsa_highSMalleable_rejected() public view {
     uint256 pk = 0xA11CE;
     address eoa = vm.addr(pk);
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
     uint256 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141; // secp256k1 curve order N
     // With the correct N, highS = n - s lands in (N/2, N): an s-value the raw ecrecover precompile
-    // ACCEPTS (s < N) but OZ's malleability guard REJECTS (s > N/2) — so assertFalse below genuinely
+    // ACCEPTS (s < N) but the inline `_recover`'s low-s guard REJECTS (s > N/2) — so assertFalse below genuinely
     // proves the guard fires, rather than the signature merely being out of ecrecover's own s<N bound.
     bytes32 highS = bytes32(n - uint256(s));
     uint8 flippedV = v == 27 ? 28 : 27;
@@ -315,9 +315,9 @@ contract SignatureValidatorTest is Test {
     );
   }
 
-  // EIP-2098 compact (64-byte) signatures ARE accepted: the ECDSA leg routes a 64-byte input through
-  // OZ tryRecover(bytes32, r, vs), which decodes the compact form and enforces low-s. Accepted via both
-  // entries (view + side-effects), matching the 65-byte (r,s,v) verdict for the same key.
+  // EIP-2098 compact (64-byte) signatures ARE accepted: the ECDSA leg's inline `_recover` decodes
+  // the 64-byte EIP-2098 (r,vs) compact form and enforces low-s. Accepted via both entries
+  // (view + side-effects), matching the 65-byte (r,s,v) verdict for the same key.
   function test_ecdsa_64byteCompactSig_accepted() public {
     uint256 pk = 0xA11CE;
     address eoa = vm.addr(pk);
@@ -352,7 +352,7 @@ contract SignatureValidatorTest is Test {
   }
 
   // Malleability on the compact path: a 64-byte sig whose decoded `s` lies in the encodable malleable
-  // window (N/2, 2^255) must be rejected by OZ's low-s guard — even though the raw ecrecover precompile
+  // window (N/2, 2^255) must be rejected by the inline `_recover`'s low-s guard — even though the raw ecrecover precompile
   // ACCEPTS it and recovers a concrete address. Load-bearing: we assert the very address raw ecrecover
   // yields is NOT validated, so the false verdict proves the guard fired (not a mere wrong-signer miss).
   // Mirrors test_ecdsa_highSMalleable_rejected on the compact (r,vs) path.
@@ -369,7 +369,7 @@ contract SignatureValidatorTest is Test {
   }
 
   // Length routing (verdict, not just no-revert): a non-6492 signature that is neither 65 nor 64 bytes
-  // (here 66) is routed to OZ tryRecover(bytes32,bytes), which returns InvalidSignatureLength → false —
+  // (here 66) returns false via the inline `_recover`, which rejects any length other than 65 or 64 —
   // even though it begins with an otherwise-valid (r,s,v). Documents the "other length" branch.
   function test_ecdsa_oddLengthSig_rejected() public view {
     uint256 pk = 0xA11CE;
@@ -378,6 +378,51 @@ contract SignatureValidatorTest is Test {
     bytes memory sig66 = abi.encodePacked(r, s, v, uint8(0)); // 66 bytes: valid (r,s,v) + one trailing byte
     assertEq(sig66.length, 66);
     assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, sig66));
+  }
+
+  // Differential fuzz: the ECDSA leg must agree with OpenZeppelin's ECDSA.tryRecover for every
+  // well-formed signature, in both 65-byte (r,s,v) and 64-byte EIP-2098 (r,vs) encodings. vm.sign
+  // yields a canonical (low-s, v in {27,28}) signature, so OZ validates it and so must we.
+  function testFuzz_ecdsa_matchesOZ(uint256 pkSeed, bytes32 hash) public view {
+    // secp256k1 order N; bound the key to [1, N-1] so vm.sign gets a valid private key.
+    uint256 pk = bound(pkSeed, 1, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140);
+    address signer = vm.addr(pk);
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, hash);
+
+    bytes memory sig65 = abi.encodePacked(r, s, v);
+    (address ozRec, ECDSA.RecoverError ozErr,) = ECDSA.tryRecover(hash, sig65);
+    bool ozValid = ozErr == ECDSA.RecoverError.NoError && ozRec == signer;
+    assertTrue(ozValid); // canonical signature: OZ always accepts
+    assertEq(SignatureValidator.isValidSignatureNow(signer, hash, sig65), ozValid);
+
+    // Same signature re-encoded as EIP-2098 compact form must match too.
+    bytes32 vs = bytes32((uint256(v - 27) << 255) | uint256(s));
+    assertEq(SignatureValidator.isValidSignatureNow(signer, hash, abi.encodePacked(r, vs)), ozValid);
+  }
+
+  // Differential fuzz across the malleability boundary: the malleated (high-s, flipped-v) form of any
+  // valid signature must be rejected by BOTH the library and OZ, proving the low-s guard matches OZ.
+  function testFuzz_ecdsa_malleated_matchesOZ(uint256 pkSeed, bytes32 hash) public view {
+    uint256 pk = bound(pkSeed, 1, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140);
+    address signer = vm.addr(pk);
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, hash);
+
+    uint256 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141; // secp256k1 order N
+    bytes memory malleated = abi.encodePacked(r, bytes32(n - uint256(s)), v == 27 ? uint8(28) : uint8(27));
+    (address ozRec, ECDSA.RecoverError ozErr,) = ECDSA.tryRecover(hash, malleated);
+    bool ozValid = ozErr == ECDSA.RecoverError.NoError && ozRec == signer;
+    assertFalse(ozValid); // OZ rejects upper-half s
+    assertEq(SignatureValidator.isValidSignatureNow(signer, hash, malleated), ozValid);
+  }
+
+  // Raw legacy v in {0,1} (not 27/28) must be rejected: ecrecover yields address(0) for such v. Both OZ
+  // and the inline leg rely on that address(0) result, so neither validates the signature.
+  function test_ecdsa_rawLegacyV_rejected() public view {
+    uint256 pk = 0xA11CE;
+    address eoa = vm.addr(pk);
+    (, bytes32 r, bytes32 s) = vm.sign(pk, HASH);
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, abi.encodePacked(r, s, uint8(0))));
+    assertFalse(SignatureValidator.isValidSignatureNow(eoa, HASH, abi.encodePacked(r, s, uint8(1))));
   }
 }
 
